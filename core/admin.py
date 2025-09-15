@@ -31,3 +31,4 @@ class ShortTermBookingAdmin(admin.ModelAdmin):
     list_filter = ("unit__condo", "status", "id_type")
     search_fields = ("guest_first_name", "guest_last_name", "id_number", "vehicle_plate", "unit__unit_number")
     autocomplete_fields = ("unit", "parking_spot")
+python manage.py runserver 0.0.0.0:8001

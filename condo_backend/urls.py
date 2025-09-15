@@ -13,6 +13,9 @@ def home(_request):
 def ping(_request):
     return JsonResponse({"pong": True})
 
+def health(_request):                     # <— add this
+    return JsonResponse({"ok": True})
+
 router = DefaultRouter()
 router.register(r"condos", CondoViewSet, basename="condo")
 router.register(r"units", UnitViewSet, basename="unit")
@@ -22,6 +25,7 @@ router.register(r"bookings", ShortTermBookingViewSet, basename="booking")
 
 urlpatterns = [
     path("", home),
+    path("api/healthz", health),          # <— add this
     path("api/ping", ping),
     path("api/", include(router.urls)),
     path("admin/", admin.site.urls),

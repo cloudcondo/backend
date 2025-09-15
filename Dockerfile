@@ -21,12 +21,9 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 # Copy project
 COPY . /app/
 
-# Runtime env (safe defaults; we’ll override via ECS later)
+# Runtime env (safe defaults; we’ll override in ECS later)
 ENV DJANGO_SETTINGS_MODULE=condo_backend.settings \
     PORT=8000
-
-# Collect static is optional now (you don’t use it yet)
-# RUN python manage.py collectstatic --noinput
 
 # Expose port for container platforms
 EXPOSE 8000
