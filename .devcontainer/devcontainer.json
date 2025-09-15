@@ -1,0 +1,13 @@
+{
+  "name": "Condo SaaS Dev",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql-client && pip install --upgrade pip && pip install django djangorestframework psycopg2-binary gunicorn",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  }
+}
