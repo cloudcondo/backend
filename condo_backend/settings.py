@@ -4,10 +4,19 @@ Django settings for condo_backend project.
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv(BASE_DIR / ".env")  # loads variables from .env into os.environ
-
+# define BASE_DIR first
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# optional .env loader (safe if file or package aren't present)
+DOTENV_PATH = BASE_DIR / ".env"
+if DOTENV_PATH.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(DOTENV_PATH)
+    except Exception:
+        pass
+
+
 
 # --------------------------
 # Core env-driven settings
