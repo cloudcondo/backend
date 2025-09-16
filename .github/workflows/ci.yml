@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Enable buildx container driver for caching support
+      # Ensure buildx uses docker-container driver so cache export works
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
