@@ -12,32 +12,54 @@ env:
 
 jobs:
   test:
-    name: Run Django tests
+    name: Django tests (SQLite)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.12", "3.13" ]  # keep 3.12; add 3.13 to match local
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install system packages (if any)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install system packages (none required)
         run: sudo apt-get update
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Run migrations & tests (SQLite)
+            - name: Django checks, migrate, seed, test
         env:
           DJANGO_SETTINGS_MODULE: condo_backend.settings
           SECRET_KEY: ci-only-secret-key-change-me
           DEBUG: "True"
           ALLOWED_HOSTS: "*"
         run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
           python manage.py migrate --noinput
+          python manage.py load_sample_data || true
+          python manage.py spectacular --file schema.yaml
           python manage.py test --verbosity 2
+      - name: Upload schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: schema.yaml
+
 
   build-and-push:
     name: Build and push Docker image to GHCR
@@ -50,7 +72,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ensure buildx uses docker-container driver so cache export works
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:

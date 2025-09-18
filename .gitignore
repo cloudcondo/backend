@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+db.sqlite3
+
+# Envs
+.venv/
+env/
+venv/
+
+# Django
+staticfiles/
+media/
+
+# VS Code / Codespaces
+.vscode/
+.python-version
+
+# Byte-compiled
+*.egg-info/
+dist/
+build/
+
+# dotenv
+.env

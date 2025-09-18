@@ -1,0 +1,34 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    build: .
+    command: gunicorn condo_backend.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120
+    environment:
+      DJANGO_SETTINGS_MODULE: condo_backend.settings
+      DB_ENGINE: postgres
+      DB_NAME: app
+      DB_USER: app
+      DB_PASSWORD: apppass
+      DB_HOST: db
+      DB_PORT: "5432"
+      SECRET_KEY: dev-secret-change-me
+      DEBUG: "True"
+      ALLOWED_HOSTS: "*"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

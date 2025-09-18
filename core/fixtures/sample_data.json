@@ -1,0 +1,111 @@
+[
+  {
+    "model": "core.condo",
+    "pk": 1,
+    "fields": {
+      "code": "TSCC1848",
+      "name": "TSCC 1848",
+      "city": "Toronto",
+      "province": "ON",
+      "created_at": "2025-01-01T00:00:00Z",
+      "updated_at": "2025-01-01T00:00:00Z"
+    }
+  },
+  {
+    "model": "core.unit",
+    "pk": 1,
+    "fields": {
+      "condo": 1,
+      "unit_number": "905",
+      "owner_name": "Alex Owner",
+      "owner_email": "alex@example.com",
+      "status": "OWNER_OCCUPIED",
+      "created_at": "2025-01-01T00:05:00Z",
+      "updated_at": "2025-01-01T00:05:00Z"
+    }
+  },
+  {
+    "model": "core.unit",
+    "pk": 2,
+    "fields": {
+      "condo": 1,
+      "unit_number": "1001",
+      "owner_name": "Blair Owner",
+      "owner_email": "blair@example.com",
+      "status": "OWNER_OCCUPIED",
+      "created_at": "2025-01-01T00:06:00Z",
+      "updated_at": "2025-01-01T00:06:00Z"
+    }
+  },
+  {
+    "model": "core.parkingspot",
+    "pk": 1,
+    "fields": {
+      "condo": 1,
+      "code": "P1-001",
+      "level": "P1",
+      "spot_type": "RESIDENT",
+      "created_at": "2025-01-01T00:10:00Z",
+      "updated_at": "2025-01-01T00:10:00Z"
+    }
+  },
+  {
+    "model": "core.parkingspot",
+    "pk": 2,
+    "fields": {
+      "condo": 1,
+      "code": "P1-002",
+      "level": "P1",
+      "spot_type": "RESIDENT",
+      "created_at": "2025-01-01T00:11:00Z",
+      "updated_at": "2025-01-01T00:11:00Z"
+    }
+  },
+  {
+    "model": "core.unitparkingassignment",
+    "pk": 1,
+    "fields": {
+      "unit": 1,
+      "parking_spot": 1,
+      "start_date": "2025-01-01",
+      "end_date": null,
+      "is_primary": true,
+      "created_at": "2025-01-01T00:15:00Z",
+      "updated_at": "2025-01-01T00:15:00Z"
+    }
+  },
+  {
+    "model": "core.unitparkingassignment",
+    "pk": 2,
+    "fields": {
+      "unit": 2,
+      "parking_spot": 2,
+      "start_date": "2025-01-01",
+      "end_date": null,
+      "is_primary": true,
+      "created_at": "2025-01-01T00:16:00Z",
+      "updated_at": "2025-01-01T00:16:00Z"
+    }
+  },
+  {
+    "model": "core.shorttermbooking",
+    "pk": 1,
+    "fields": {
+      "unit": 1,
+      "parking_spot": 1,
+      "guest_first_name": "Casey",
+      "guest_last_name": "Guest",
+      "id_type": "LICENSE",
+      "id_number": "A1234567",
+      "id_country": "CA",
+      "id_province_state": "ON",
+      "vehicle_plate": "ABCX123",
+      "check_in": "2025-09-16",
+      "check_out": "2025-09-16",
+      "status": "pending",
+      "notes": "fixture booking",
+      "created_at": "2025-01-01T00:20:00Z",
+      "updated_at": "2025-01-01T00:20:00Z"
+    }
+  }
+]
