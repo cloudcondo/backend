@@ -1,7 +1,7 @@
 PROJECT EXPORT (plain text)
 Root: /workspaces/backend
-Generated: 2025-09-18 18:47:36 UTC
-Files included: 75
+Generated: 2025-09-18 19:17:54 UTC
+Files included: 77
 Max bytes per file: 200000
 include_sensitive: False
 include_binaries: False
@@ -101,7 +101,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.12", "3.13" ]  # keep 3.12; add 3.13 to match local
+        python-version: [ "3.12", "3.13" ]
     steps:
       - uses: actions/checkout@v4
 
@@ -117,15 +117,12 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-${{ matrix.python-version }}-
 
-      - name: Install system packages (none required)
-        run: sudo apt-get update
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-            - name: Django checks, migrate, seed, test
+      - name: Django checks, migrate, seed, schema
         env:
           DJANGO_SETTINGS_MODULE: condo_backend.settings
           SECRET_KEY: ci-only-secret-key-change-me
@@ -137,13 +134,24 @@ jobs:
           python manage.py migrate --noinput
           python manage.py load_sample_data || true
           python manage.py spectacular --file schema.yaml
+
+      - name: CI dry-run CSV import (smoke)
+        env:
+          DJANGO_SETTINGS_MODULE: condo_backend.settings
+        run: |
+          python manage.py ci_dry_run_import_check
+
+      - name: Run test suite
+        env:
+          DJANGO_SETTINGS_MODULE: condo_backend.settings
+        run: |
           python manage.py test --verbosity 2
+
       - name: Upload schema artifact
         uses: actions/upload-artifact@v4
         with:
           name: openapi-schema
           path: schema.yaml
-
 
   build-and-push:
     name: Build and push Docker image to GHCR
@@ -339,7 +347,17 @@ superuser:
 ================================================================================
 FILE: README.md
 ================================================================================
-# backend
+# Condo Backend
+
+A Django/DRF service for condo parking assignments and guest bookings.
+
+## Quick start (dev / Codespaces)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py runserver 0.0.0.0:8000
 
 ================================================================================
 FILE: accounts/__init__.py
@@ -1494,6 +1512,83 @@ class Command(BaseCommand):
             self.stderr.write(f"Incomplete assignments (no unit or no spot): {missing}")
             raise SystemExit(1)
         self.stdout.write(self.style.SUCCESS("Assignment round-trip looks good."))
+
+================================================================================
+FILE: core/management/commands/ci_dry_run_import_check.py
+================================================================================
+# core/management/commands/ci_dry_run_import_check.py
+import csv
+from io import BytesIO
+
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand, CommandError
+from rest_framework.test import APIClient
+
+from accounts.models import UserProfile
+from core.models import Condo, ParkingSpot, Unit
+
+
+class Command(BaseCommand):
+    help = "CI smoke: POST /api/assignments/import.csv?dry_run=1 and assert counts in JSON response."
+
+    def handle(self, *args, **opts):
+        # Make sure we have at least one condo/unit/spot (fixtures/seeded in CI)
+        condo = Condo.objects.first()
+        unit = Unit.objects.filter(condo=condo).first() if condo else None
+        spot = ParkingSpot.objects.filter(condo=condo).first() if condo else None
+        if not (condo and unit and spot):
+            raise CommandError(
+                "Missing seeded data (condo/unit/spot). Load fixtures first."
+            )
+
+        # Build minimal CSV in memory
+        mem = BytesIO()
+        writer = csv.writer(mem)
+        writer.writerow(
+            [
+                "condo_code",
+                "unit_number",
+                "parking_code",
+                "status",
+                "effective_start",
+                "effective_end",
+            ]
+        )
+        writer.writerow([condo.code, unit.unit_number, spot.code, "active", "", ""])
+        mem.seek(0)
+        mem.name = "assignments.csv"  # DRF uses .name to infer filename
+
+        # Create a PM user (so endpoint is authorized)
+        U = get_user_model()
+        pm, _ = U.objects.get_or_create(
+            username="ci-pm", defaults={"email": "ci-pm@example.com", "is_staff": True}
+        )
+        prof, _ = UserProfile.objects.get_or_create(user=pm)
+        prof.role = "pm"
+        prof.save()
+
+        client = APIClient()
+        client.force_authenticate(user=pm)
+        resp = client.post(
+            "/api/assignments/import.csv?dry_run=1",
+            data={"file": mem},
+            format="multipart",
+        )
+        if resp.status_code != 200:
+            raise CommandError(
+                f"Import endpoint failed: {resp.status_code} {resp.content!r}"
+            )
+
+        data = resp.json()
+        # We expect at least one processed row and no crash
+        if "total_rows" not in data or data["total_rows"] < 1:
+            raise CommandError(f"Unexpected response: {data}")
+        # Accepted keys present
+        for key in ["created", "updated", "errors", "dry_run"]:
+            if key not in data:
+                raise CommandError(f"Missing key '{key}' in response: {data}")
+
+        self.stdout.write(self.style.SUCCESS("CI dry-run CSV import check passed."))
 
 ================================================================================
 FILE: core/management/commands/export_assignments_csv.py
@@ -3197,11 +3292,13 @@ from datetime import datetime
 from pathlib import Path
 
 from django.conf import settings
-from django.http import FileResponse, HttpResponse
+from django.http import HttpResponse
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from accounts.permissions import IsAuthenticatedJWT, IsPropertyManager
 
 from .services.csv_assignments import (
     export_assignments_to_csv,
@@ -3209,8 +3306,10 @@ from .services.csv_assignments import (
 )
 
 
+@extend_schema(tags=["Assignments"])
 class AssignmentsCSVExportView(APIView):
-    permission_classes = [IsAuthenticated]
+    # PM only
+    permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
 
     def get(self, request):
         filename, content = export_assignments_to_csv()
@@ -3219,6 +3318,7 @@ class AssignmentsCSVExportView(APIView):
         return response
 
 
+@extend_schema(tags=["Assignments"])
 class AssignmentsCSVImportView(APIView):
     """
     POST multipart/form-data with 'file'.
@@ -3226,7 +3326,8 @@ class AssignmentsCSVImportView(APIView):
     Returns JSON summary and, if errors, a link to an error CSV file when not dry_run.
     """
 
-    permission_classes = [IsAuthenticated]
+    # PM only
+    permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
 
     def post(self, request):
         file = request.FILES.get("file")
@@ -3245,7 +3346,6 @@ class AssignmentsCSVImportView(APIView):
 
         errors_path = ""
         if result.get("errors") and not dry_run:
-            # write error csv to MEDIA_ROOT/import_errors
             media_root = Path(getattr(settings, "MEDIA_ROOT", "media"))
             out_dir = media_root / "import_errors"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -3263,13 +3363,14 @@ class AssignmentsCSVImportView(APIView):
             "total_rows": result.get("total_rows"),
             "dry_run": dry_run,
             "errors_csv_url": errors_path,
-            "error_rows": result.get("error_rows", []),  # keep details for UI too
+            "error_rows": result.get("error_rows", []),
         }
         return Response(payload, status=status.HTTP_200_OK)
 
 ================================================================================
 FILE: core/views_lookup.py
 ================================================================================
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -3278,6 +3379,7 @@ from rest_framework.views import APIView
 from .models import ParkingSpot, Unit, UnitParkingAssignment
 
 
+@extend_schema(tags=["Lookups"])
 class UnitParkingLookupView(APIView):
     """
     GET /api/units/<unit_id>/parking
@@ -3317,6 +3419,7 @@ class UnitParkingLookupView(APIView):
         return Response({"unit": str(unit), "count": len(results), "results": results})
 
 
+@extend_schema(tags=["Lookups"])
 class SpotUnitLookupView(APIView):
     """
     GET /api/spots/<spot_id>/unit
@@ -3372,6 +3475,7 @@ from datetime import date, timedelta
 
 from django.db.models import Q
 from django.utils.dateparse import parse_date
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -3382,7 +3486,6 @@ from .models import ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
 
 
 def _parse_window(window_param: str) -> timedelta:
-    # e.g., "7d" -> 7 days
     if not window_param:
         return timedelta(days=7)
     try:
@@ -3393,6 +3496,7 @@ def _parse_window(window_param: str) -> timedelta:
         return timedelta(days=7)
 
 
+@extend_schema(tags=["Reports"])
 class UnitBookingsReportView(APIView):
     """
     GET /reports/unit/{id}/bookings
@@ -3438,6 +3542,7 @@ class UnitBookingsReportView(APIView):
         return Response({"unit": str(unit), "count": len(data), "results": data})
 
 
+@extend_schema(tags=["Reports"])
 class AvailableSpotsReportView(APIView):
     """
     GET /reports/available-spots?date=YYYY-MM-DD&condo_id=<id>
@@ -3459,10 +3564,8 @@ class AvailableSpotsReportView(APIView):
                 {"detail": "Missing condo_id."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Spots in the condo
         spots = ParkingSpot.objects.filter(condo_id=condo_id)
 
-        # Spots assigned on the date (active assignment range includes d)
         active_assignments = UnitParkingAssignment.objects.filter(
             parking_spot__in=spots,
             start_date__lte=d,
@@ -3471,7 +3574,6 @@ class AvailableSpotsReportView(APIView):
             active_assignments.values_list("parking_spot_id", flat=True)
         )
 
-        # Spots booked for the date (inclusive overlap)
         day_q = Q(check_in__lte=d, check_out__gte=d)
         day_booked_spot_ids = set(
             ShortTermBooking.objects.filter(parking_spot__in=spots)
@@ -3496,6 +3598,7 @@ class AvailableSpotsReportView(APIView):
         )
 
 
+@extend_schema(tags=["Reports"])
 class UpcomingCheckpointsReportView(APIView):
     """
     GET /reports/upcoming-checkpoints?window=7d
@@ -4113,6 +4216,62 @@ class CsvDryRunAndLookupTests(TestCase):
             ).exists()
         )
         self.assertIn("total_rows", data)
+
+================================================================================
+FILE: tests/test_lookup_permissions.py
+================================================================================
+# tests/test_lookup_permissions.py
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from accounts.models import UnitAccess, UserProfile
+from core.models import Condo, ParkingSpot, Unit, UnitParkingAssignment
+
+
+class LookupPermissionsTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.condo = Condo.objects.create(code="CC02", name="Cloud Condo Two")
+        cls.unit = Unit.objects.create(condo=cls.condo, unit_number="201")
+        cls.spot = ParkingSpot.objects.create(condo=cls.condo, code="B1")
+        UnitParkingAssignment.objects.create(
+            unit=cls.unit, parking_spot=cls.spot, is_primary=True
+        )
+
+        U = get_user_model()
+        cls.pm = U.objects.create_user(username="pm2", password="x")
+        UserProfile.objects.create(user=cls.pm, role="pm")
+
+        cls.con = U.objects.create_user(username="con2", password="x")
+        UserProfile.objects.create(user=cls.con, role="con")
+
+        cls.owner = U.objects.create_user(username="own2", password="x")
+        UserProfile.objects.create(user=cls.owner, role="own")
+        UnitAccess.objects.create(user=cls.owner, unit=cls.unit)
+
+    def test_unauth_blocked(self):
+        c = APIClient()
+        self.assertEqual(c.get(f"/api/units/{self.unit.id}/parking").status_code, 401)
+        self.assertEqual(c.get(f"/api/spots/{self.spot.id}/unit").status_code, 401)
+
+    def test_pm_allowed(self):
+        c = APIClient()
+        c.force_authenticate(self.pm)
+        self.assertEqual(c.get(f"/api/units/{self.unit.id}/parking").status_code, 200)
+        self.assertEqual(c.get(f"/api/spots/{self.spot.id}/unit").status_code, 200)
+
+    def test_concierge_allowed(self):
+        c = APIClient()
+        c.force_authenticate(self.con)
+        self.assertEqual(c.get(f"/api/units/{self.unit.id}/parking").status_code, 200)
+        self.assertEqual(c.get(f"/api/spots/{self.spot.id}/unit").status_code, 200)
+
+    def test_owner_allowed(self):
+        c = APIClient()
+        c.force_authenticate(self.owner)
+        self.assertEqual(c.get(f"/api/units/{self.unit.id}/parking").status_code, 200)
+        self.assertEqual(c.get(f"/api/spots/{self.spot.id}/unit").status_code, 200)
 
 ================================================================================
 FILE: tests/test_permissions.py:

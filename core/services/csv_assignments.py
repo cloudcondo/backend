@@ -1,3 +1,4 @@
+# core/services/csv_assignments.py
 import csv
 import io
 from datetime import date, datetime
@@ -153,7 +154,7 @@ def import_assignments_from_csv(uploaded_file, dry_run: bool = False) -> Dict[st
     error_rows: List[Dict[str, Any]] = []
     total = 0
 
-    # Keep a list of objects to write only if not dry_run
+    # Keep explicit lists of write ops when not dry_run
     pending_updates: List[UnitParkingAssignment] = []
     pending_creates: List[UnitParkingAssignment] = []
 
@@ -205,21 +206,22 @@ def import_assignments_from_csv(uploaded_file, dry_run: bool = False) -> Dict[st
             start_date = _parse_date(start_raw) if start_raw else None
             end_date = _parse_date(end_raw) if end_raw else None
 
-            obj, existed = UnitParkingAssignment.objects.get_or_create(
+            obj, created_now = UnitParkingAssignment.objects.get_or_create(
                 unit=unit,
                 parking_spot=spot,
                 defaults={
-                    "start_date": start_date,
+                    "start_date": start_date or date.today(),
                     "end_date": end_date,
                     "is_primary": bool(is_primary) if is_primary is not None else False,
                 },
             )
-            if existed:
-                if dry_run:
-                    created += 1  # would be created
-                else:
-                    created += 1
+            if created_now:
+                # new row
+                created += 1
+                if not dry_run:
+                    pending_creates.append(obj)
             else:
+                # existing: apply changes if any
                 changed = False
                 if start_date is not None and obj.start_date != start_date:
                     obj.start_date = start_date
@@ -231,9 +233,8 @@ def import_assignments_from_csv(uploaded_file, dry_run: bool = False) -> Dict[st
                     obj.is_primary = bool(is_primary)
                     changed = True
                 if changed:
-                    if dry_run:
-                        updated += 1  # would be updated
-                    else:
+                    updated += 1
+                    if not dry_run:
                         pending_updates.append(obj)
 
         except Exception as e:
@@ -242,10 +243,8 @@ def import_assignments_from_csv(uploaded_file, dry_run: bool = False) -> Dict[st
 
     # Apply writes if not dry_run
     if not dry_run:
-        if pending_creates:
-            UnitParkingAssignment.objects.bulk_create(
-                pending_creates, ignore_conflicts=True
-            )
+        # obj from get_or_create is already in DB when created_now=True, so
+        # pending_creates is informational only; we still ensure updates are saved.
         for obj in pending_updates:
             obj.save(update_fields=["start_date", "end_date", "is_primary"])
 

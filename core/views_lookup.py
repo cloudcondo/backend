@@ -1,10 +1,29 @@
+# core/views_lookup.py
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.models import Role, UnitAccess
+
 from .models import ParkingSpot, Unit, UnitParkingAssignment
+
+
+def _role(user):
+    return getattr(getattr(user, "profile", None), "role", None)
+
+
+def _user_unit_ids(user):
+    """Unit IDs a user may access. PM/Concierge -> all units; others via UnitAccess."""
+    r = _role(user)
+    if r in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
+        return set(Unit.objects.values_list("id", flat=True))
+    return set(
+        UnitAccess.objects.filter(user=user, active=True).values_list(
+            "unit_id", flat=True
+        )
+    )
 
 
 @extend_schema(tags=["Lookups"])
@@ -23,6 +42,14 @@ class UnitParkingLookupView(APIView):
             return Response(
                 {"detail": "Unit not found."}, status=status.HTTP_404_NOT_FOUND
             )
+
+        # permission check
+        r = _role(request.user)
+        if r not in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
+            if unit.id not in _user_unit_ids(request.user):
+                return Response(
+                    {"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN
+                )
 
         qs = (
             UnitParkingAssignment.objects.select_related("parking_spot", "unit__condo")
@@ -64,11 +91,27 @@ class SpotUnitLookupView(APIView):
                 {"detail": "Parking spot not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
+        # fetch history first to determine current unit
         qs = (
             UnitParkingAssignment.objects.select_related("unit", "unit__condo")
             .filter(parking_spot=spot)
             .order_by("-start_date", "-id")
         )
+
+        # permission: PM/Concierge ok; others must have access to current active unit (if any)
+        r = _role(request.user)
+        if r not in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
+            current_active = next((a for a in qs if a.end_date is None), None)
+            if not current_active:
+                return Response(
+                    {"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN
+                )
+            allowed_unit_ids = _user_unit_ids(request.user)
+            if current_active.unit_id not in allowed_unit_ids:
+                return Response(
+                    {"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN
+                )
+
         history = []
         current_unit = None
         for a in qs:

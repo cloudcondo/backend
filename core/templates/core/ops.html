@@ -1,0 +1,114 @@
+<!-- core/templates/core/ops.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Condo Ops</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; padding: 16px; }
+    h1, h2 { margin: 0 0 8px; }
+    section { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    label { display: block; margin: 6px 0 4px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input[type="text"], input[type="number"], input[type="date"] { padding: 6px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 8px 12px; border: 1px solid #999; border-radius: 6px; background: #f2f2f2; cursor: pointer; }
+    pre { background: #f7f7f7; padding: 8px; border-radius: 6px; overflow: auto; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Condo Ops</h1>
+  <p class="muted">Upload assignments CSV; run reports without any build tools.</p>
+
+  <section>
+    <h2>Upload Assignments CSV</h2>
+    <form id="csvForm">
+      <label>CSV file</label>
+      <input type="file" id="csvFile" accept=".csv" required />
+      <div class="row">
+        <label><input type="checkbox" id="dryRun" /> Dry run (validate only)</label>
+      </div>
+      <button type="submit">Upload</button>
+      <a href="/api/assignments/latest.csv">Download latest export</a>
+    </form>
+    <pre id="csvResult"></pre>
+  </section>
+
+  <section>
+    <h2>Unit Bookings Report</h2>
+    <div class="row">
+      <label>Unit ID <input type="number" id="unitId" placeholder="e.g. 1" /></label>
+      <label>Status <input type="text" id="status" placeholder="pending|approved|..." /></label>
+      <button id="runUnitBookings">Run</button>
+    </div>
+    <pre id="unitBookingsOut"></pre>
+  </section>
+
+  <section>
+    <h2>Available Spots Report</h2>
+    <div class="row">
+      <label>Date <input type="date" id="availDate" /></label>
+      <label>Condo ID <input type="number" id="condoId" placeholder="e.g. 1" /></label>
+      <button id="runAvail">Run</button>
+    </div>
+    <pre id="availOut"></pre>
+  </section>
+
+  <section>
+    <h2>Upcoming Checkpoints</h2>
+    <div class="row">
+      <label>Window (days or Nd) <input type="text" id="window" placeholder="7d" /></label>
+      <button id="runUpcoming">Run</button>
+    </div>
+    <pre id="upcomingOut"></pre>
+  </section>
+
+  <script>
+    function showJSON(el, data) { el.textContent = JSON.stringify(data, null, 2); }
+
+    document.getElementById('csvForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const file = document.getElementById('csvFile').files[0];
+      if (!file) return;
+      const dry = document.getElementById('dryRun').checked;
+      const fd = new FormData();
+      fd.append('file', file, file.name);
+      const res = await fetch(`/api/assignments/import.csv?dry_run=${dry ? '1' : '0'}`, { method: 'POST', body: fd, credentials: 'include' });
+      const out = document.getElementById('csvResult');
+      if (!res.ok) { out.textContent = `HTTP ${res.status}`; return; }
+      const data = await res.json();
+      showJSON(out, data);
+    });
+
+    document.getElementById('runUnitBookings').addEventListener('click', async () => {
+      const unitId = document.getElementById('unitId').value.trim();
+      if (!unitId) return;
+      const status = document.getElementById('status').value.trim();
+      const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+      const res = await fetch(`/api/reports/unit/${encodeURIComponent(unitId)}/bookings${qs}`, { credentials: 'include' });
+      const out = document.getElementById('unitBookingsOut');
+      showJSON(out, await res.json());
+    });
+
+    document.getElementById('runAvail').addEventListener('click', async () => {
+      const d = document.getElementById('availDate').value;
+      const condoId = document.getElementById('condoId').value.trim();
+      if (!condoId) return;
+      const params = new URLSearchParams();
+      if (d) params.set('date', d);
+      params.set('condo_id', condoId);
+      const res = await fetch(`/api/reports/available-spots?${params.toString()}`, { credentials: 'include' });
+      const out = document.getElementById('availOut');
+      showJSON(out, await res.json());
+    });
+
+    document.getElementById('runUpcoming').addEventListener('click', async () => {
+      const w = document.getElementById('window').value.trim() || '7d';
+      const res = await fetch(`/api/reports/upcoming-checkpoints?window=${encodeURIComponent(w)}`, { credentials: 'include' });
+      const out = document.getElementById('upcomingOut');
+      showJSON(out, await res.json());
+    });
+  </script>
+</body>
+</html>
