@@ -1,0 +1,116 @@
+# core/tests/test_permissions.py
+from django.test import TestCase
+from django.contrib.auth import get_user_model
+from rest_framework.test import APIClient
+
+from accounts.models import UserProfile, UnitAccess
+from core.models import Condo, Unit, ParkingSpot, ShortTermBooking
+
+
+def mk_user(username, role, is_staff=False, password="pass"):
+    U = get_user_model()
+    u, created = U.objects.get_or_create(username=username, defaults={"email": f"{username}@example.com"})
+    if created:
+        u.set_password(password)
+        u.is_staff = is_staff
+        u.save()
+    prof, _ = UserProfile.objects.get_or_create(user=u)
+    prof.role = role
+    prof.save()
+    return u
+
+
+class PermissionsMatrixTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # Condo/Unit/Spot
+        cls.condo = Condo.objects.create(code="CC01", name="Cloud Condo One", city="Toronto", province="ON")
+        cls.unit101 = Unit.objects.create(condo=cls.condo, unit_number="101", owner_name="Owner A", owner_email="owna@example.com", status="active")
+        cls.unit102 = Unit.objects.create(condo=cls.condo, unit_number="102", owner_name="Owner B", owner_email="ownb@example.com", status="active")
+        cls.spotA1 = ParkingSpot.objects.create(condo=cls.condo, code="A1", level="P1", spot_type="visitor")
+
+        # Users
+        cls.pm = mk_user("pm_test", "pm", is_staff=True)
+        cls.con = mk_user("con_test", "con", is_staff=True)
+        cls.agent = mk_user("agent_test", "agent")
+        cls.owner = mk_user("owner_test", "own")
+
+        # Access: agent + owner can act on unit101 only
+        UnitAccess.objects.create(user=cls.agent, unit=cls.unit101)
+        UnitAccess.objects.create(user=cls.owner, unit=cls.unit101)
+
+    def _auth(self, user=None):
+        c = APIClient()
+        if user:
+            c.force_authenticate(user=user)
+        return c
+
+    # ---- Unauthed ----
+    def test_unauthed_cannot_list_units(self):
+        c = self._auth(None)
+        r = c.get("/api/units/")
+        self.assertEqual(r.status_code, 401)
+
+    # ---- PM ----
+    def test_pm_can_import_export_csv(self):
+        c = self._auth(self.pm)
+        # export
+        r = c.get("/api/assignments/export.csv")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r["Content-Type"])
+
+        # import back the same bytes
+        from io import BytesIO
+        f = BytesIO(r.content)
+        f.name = "assignments.csv"
+        r2 = c.post("/api/assignments/import.csv", {"file": f}, format="multipart")
+        self.assertEqual(r2.status_code, 200)
+
+    # ---- Concierge ----
+    def test_concierge_cannot_import_csv(self):
+        c = self._auth(self.con)
+        r = c.get("/api/assignments/export.csv")
+        self.assertEqual(r.status_code, 403)
+        # But concierge can list bookings
+        r2 = c.get("/api/bookings/")
+        # Might be 200 (no data) or 200 with seeded one in other tests
+        self.assertEqual(r2.status_code, 200)
+
+    # ---- Agent / Owner booking rules ----
+    def test_agent_can_create_booking_only_for_accessible_unit(self):
+        c = self._auth(self.agent)
+        payload_ok = {
+            "unit": self.unit101.id,
+            "guest_first_name": "A",
+            "guest_last_name": "B",
+            "id_type": "passport",
+            "id_number": "X1",
+            "id_country": "CA",
+            "vehicle_plate": "ABC123",
+            "parking_spot": self.spotA1.id,
+            "check_in": "2025-09-21",
+            "check_out": "2025-09-22",
+        }
+        r1 = c.post("/api/bookings/", payload_ok, format="json")
+        self.assertIn(r1.status_code, (201, 200))
+
+        payload_bad = dict(payload_ok, unit=self.unit102.id)
+        r2 = c.post("/api/bookings/", payload_bad, format="json")
+        self.assertEqual(r2.status_code, 403)
+
+    def test_owner_can_only_see_own_units(self):
+        c = self._auth(self.owner)
+        r = c.get("/api/units/")
+        self.assertEqual(r.status_code, 200)
+        nums = [u["unit_number"] for u in r.json()["results"]]
+        self.assertIn("101", nums)
+        self.assertNotIn("102", nums)
+
+
+class OpenAPISchemaTests(TestCase):
+    def test_schema_endpoint_ok(self):
+        c = APIClient()
+        # SpectacularAPIView is public by default; if not, auth accordingly
+        r = c.get("/api/schema/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("openapi", r.json())

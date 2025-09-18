@@ -1,0 +1,3 @@
+condo_code,unit_number,spot_code,start_date,end_date,is_primary
+TSCC1848,1001,P1-002,2025-01-01,,true
+TSCC1848,905,P1-001,2025-01-01,,true

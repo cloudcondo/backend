@@ -1,6 +1,11 @@
 Django==5.2.6
 djangorestframework==3.16.1
 gunicorn==22.0.0
-psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 django-cors-headers==4.8.0
+djangorestframework-simplejwt==5.3.1
+django-filter==24.3
+flake8
+drf-spectacular
+drf-spectacular-sidecar
+django-crontab==0.7.1
