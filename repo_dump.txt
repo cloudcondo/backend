@@ -1,7 +1,7 @@
 PROJECT EXPORT (plain text)
 Root: /workspaces/backend
-Generated: 2025-09-18 15:44:03 UTC
-Files included: 51
+Generated: 2025-09-18 18:23:08 UTC
+Files included: 72
 Max bytes per file: 200000
 include_sensitive: False
 include_binaries: False
@@ -70,6 +70,16 @@ CSRF_TRUSTED_ORIGINS=https://your-app.example.com,https://admin.your-app.example
 # DB_PORT=5432
 
 ================================================================================
+FILE: .flake8
+================================================================================
+[flake8]
+max-line-length = 88
+extend-ignore = E203, W503, E501, F401
+per-file-ignores =
+    */migrations/*: E501,F401
+    __init__.py: F401
+
+================================================================================
 FILE: .github/workflows/ci.yml
 ================================================================================
 name: CI (build, test, push image)
@@ -115,7 +125,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Django checks, migrate, seed, test
+            - name: Django checks, migrate, seed, test
         env:
           DJANGO_SETTINGS_MODULE: condo_backend.settings
           SECRET_KEY: ci-only-secret-key-change-me
@@ -123,10 +133,17 @@ jobs:
           ALLOWED_HOSTS: "*"
         run: |
           python manage.py check
+          python manage.py makemigrations --check --dry-run
           python manage.py migrate --noinput
-          # seed sample data for predictable tests
           python manage.py load_sample_data || true
+          python manage.py spectacular --file schema.yaml
           python manage.py test --verbosity 2
+      - name: Upload schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: schema.yaml
+
 
   build-and-push:
     name: Build and push Docker image to GHCR
@@ -204,6 +221,32 @@ build/
 .env
 
 ================================================================================
+FILE: .isort.cfg
+================================================================================
+[settings]
+profile = black
+line_length = 88
+combine_as_imports = true
+include_trailing_comma = true
+
+================================================================================
+FILE: .pre-commit-config.yaml
+================================================================================
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+
+================================================================================
 FILE: Dockerfile
 ================================================================================
 # Python base
@@ -240,6 +283,60 @@ EXPOSE 8000
 CMD ["gunicorn", "condo_backend.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "120"]
 
 ================================================================================
+FILE: Makefile
+================================================================================
+VENV=.venv
+PY=$(VENV)/bin/python
+PIP=$(VENV)/bin/pip
+
+.PHONY: init check makemigrations migrate seed roundtrip test resetdb lint shell run docs schema superuser
+
+init:
+	python3 -m venv $(VENV)
+	$(PIP) install --upgrade pip
+	$(PIP) install -r requirements.txt
+
+check:
+	$(PY) manage.py check
+
+makemigrations:
+	$(PY) manage.py makemigrations
+
+migrate:
+	$(PY) manage.py migrate
+
+seed:
+	$(PY) manage.py load_sample_data
+
+roundtrip:
+	$(PY) manage.py check_csv_roundtrip
+
+test:
+	$(PY) manage.py test -q
+
+resetdb:
+	$(PY) manage.py flush --no-input && $(PY) manage.py migrate
+
+lint:
+	$(VENV)/bin/flake8 accounts core
+
+shell:
+	$(PY) manage.py shell
+
+run:
+	$(PY) manage.py runserver 0.0.0.0:8000
+
+# OpenAPI helpers
+schema:
+	$(PY) manage.py spectacular --file openapi.yaml
+
+docs:
+	@echo "Docs live at http://localhost:8000/api/docs/ (Swagger) and /api/redoc/"
+
+superuser:
+	$(PY) manage.py createsuperuser
+
+================================================================================
 FILE: README.md
 ================================================================================
 # backend
@@ -253,8 +350,11 @@ default_app_config = "accounts.apps.AccountsConfig"
 FILE: accounts/admin.py
 ================================================================================
 from django.contrib import admin
-from django.utils.html import format_html
-from .models import UserProfile, UnitAccess
+from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
+from django.contrib.auth.models import User
+
+from .models import UnitAccess, UserProfile
+
 
 @admin.register(UserProfile)
 class UserProfileAdmin(admin.ModelAdmin):
@@ -262,16 +362,36 @@ class UserProfileAdmin(admin.ModelAdmin):
     list_filter = ("role", "condo")
     search_fields = ("user__username", "user__email", "phone")
 
+
+class UnitAccessInline(admin.TabularInline):
+    model = UnitAccess
+    extra = 0
+    autocomplete_fields = ("unit",)
+    fields = ("unit", "access_type", "active", "created_at")
+    readonly_fields = ("created_at",)
+
+
+class UserAdmin(DjangoUserAdmin):
+    inlines = [UnitAccessInline]
+
+
+# Re-register User with inline
+admin.site.unregister(User)
+admin.site.register(User, UserAdmin)
+
+
 @admin.register(UnitAccess)
 class UnitAccessAdmin(admin.ModelAdmin):
     list_display = ("user", "unit", "access_type", "active", "created_at", "updated_at")
     list_filter = ("access_type", "active", "unit__condo")
     search_fields = ("user__username", "user__email", "unit__unit_number")
+    autocomplete_fields = ("user", "unit")
 
 ================================================================================
 FILE: accounts/apps.py
 ================================================================================
 from django.apps import AppConfig
+
 
 class AccountsConfig(AppConfig):
     default_auto_field = "django.db.models.AutoField"
@@ -283,11 +403,136 @@ class AccountsConfig(AppConfig):
         from . import signals  # noqa: F401
 
 ================================================================================
+FILE: accounts/management/commands/seed_demo.py
+================================================================================
+# accounts/management/commands/seed_demo.py
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand
+from django.db import transaction
+
+from accounts.models import UnitAccess, UserProfile
+from core.models import (
+    Condo,
+    ParkingSpot,
+    ShortTermBooking,
+    Unit,
+    UnitParkingAssignment,
+)
+
+
+class Command(BaseCommand):
+    help = "Seeds demo data: users with roles, units, parking, unit access, and a sample booking"
+
+    @transaction.atomic
+    def handle(self, *args, **options):
+        U = get_user_model()
+
+        # --- Users ---
+        users = {
+            "pm": {"username": "pm", "email": "pm@example.com", "password": "changeme"},
+            "con": {
+                "username": "con",
+                "email": "con@example.com",
+                "password": "changeme",
+            },
+            "agent": {
+                "username": "agent",
+                "email": "agent@example.com",
+                "password": "changeme",
+            },
+            "owner": {
+                "username": "owner",
+                "email": "owner@example.com",
+                "password": "changeme",
+            },
+        }
+        created_users = {}
+        for role_key, payload in users.items():
+            user, created = U.objects.get_or_create(
+                username=payload["username"], defaults={"email": payload["email"]}
+            )
+            if created:
+                user.set_password(payload["password"])
+                user.is_staff = role_key == "pm" or role_key == "con"
+                user.is_superuser = False
+                user.save()
+            profile, _ = UserProfile.objects.get_or_create(user=user)
+            profile.role = role_key  # 'pm', 'con', 'agent', 'own'
+            if role_key == "owner":
+                profile.role = "own"
+            profile.save()
+            created_users[role_key] = user
+
+        # --- Condos / Units / Parking ---
+        condo, _ = Condo.objects.get_or_create(
+            code="CC01",
+            defaults={"name": "Cloud Condo One", "city": "Toronto", "province": "ON"},
+        )
+        unit101, _ = Unit.objects.get_or_create(
+            condo=condo,
+            unit_number="101",
+            defaults={
+                "owner_name": "Alice Owner",
+                "owner_email": "alice@example.com",
+                "status": "active",
+            },
+        )
+        unit102, _ = Unit.objects.get_or_create(
+            condo=condo,
+            unit_number="102",
+            defaults={
+                "owner_name": "Bob Owner",
+                "owner_email": "bob@example.com",
+                "status": "active",
+            },
+        )
+
+        spotA1, _ = ParkingSpot.objects.get_or_create(
+            condo=condo, code="A1", defaults={"level": "P1", "spot_type": "visitor"}
+        )
+        spotA2, _ = ParkingSpot.objects.get_or_create(
+            condo=condo, code="A2", defaults={"level": "P1", "spot_type": "standard"}
+        )
+
+        UnitParkingAssignment.objects.get_or_create(
+            unit=unit101, parking_spot=spotA2, defaults={"is_primary": True}
+        )
+
+        # --- UnitAccess (agent + owner can access unit 101) ---
+        UnitAccess.objects.get_or_create(user=created_users["agent"], unit=unit101)
+        UnitAccess.objects.get_or_create(user=created_users["owner"], unit=unit101)
+
+        # --- Sample booking (pending) ---
+        ShortTermBooking.objects.get_or_create(
+            unit=unit101,
+            parking_spot=spotA1,
+            guest_first_name="Guest",
+            guest_last_name="Example",
+            defaults={
+                "id_type": "passport",
+                "id_number": "X1234567",
+                "id_country": "CA",
+                "vehicle_plate": "TEST-123",
+                "check_in": "2025-09-20",
+                "check_out": "2025-09-22",
+                "status": "pending",
+            },
+        )
+
+        self.stdout.write(self.style.SUCCESS("✅ Seeded demo data."))
+        self.stdout.write(self.style.SUCCESS("Users (password for all = 'changeme'):"))
+        self.stdout.write("  - pm      (Property Manager, staff)")
+        self.stdout.write("  - con     (Concierge, staff)")
+        self.stdout.write("  - agent   (3rd-party rental manager)")
+        self.stdout.write("  - owner   (Unit owner)")
+
+================================================================================
 FILE: accounts/migrations/0001_initial.py
 ================================================================================
+import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
-import django.db.models.deletion
+
 
 class Migration(migrations.Migration):
 
@@ -295,7 +540,10 @@ class Migration(migrations.Migration):
 
     # Make sure core tables exist first (Unit/Condo)
     dependencies = [
-        ("core", "0006_remove_parkingspot_notes_db"),  # safe, already applied in your project
+        (
+            "core",
+            "0006_remove_parkingspot_notes_db",
+        ),  # safe, already applied in your project
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -303,13 +551,50 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="UserProfile",
             fields=[
-                ("id", models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-                ("role", models.CharField(choices=[("pm","Property Manager"),("concierge","Concierge"),("owner","Owner"),("guest","Guest"),("partner","Rental Manager / Partner")], default="guest", max_length=20)),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "role",
+                    models.CharField(
+                        choices=[
+                            ("pm", "Property Manager"),
+                            ("concierge", "Concierge"),
+                            ("owner", "Owner"),
+                            ("guest", "Guest"),
+                            ("partner", "Rental Manager / Partner"),
+                        ],
+                        default="guest",
+                        max_length=20,
+                    ),
+                ),
                 ("phone", models.CharField(blank=True, default="", max_length=50)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("condo", models.ForeignKey(blank=True, help_text="Primary condo this user is associated with (optional).", null=True, on_delete=django.db.models.deletion.SET_NULL, to="core.condo")),
-                ("user", models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name="profile", to=settings.AUTH_USER_MODEL)),
+                (
+                    "condo",
+                    models.ForeignKey(
+                        blank=True,
+                        help_text="Primary condo this user is associated with (optional).",
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        to="core.condo",
+                    ),
+                ),
+                (
+                    "user",
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="profile",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
             options={
                 "verbose_name": "User Profile",
@@ -320,13 +605,47 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="UnitAccess",
             fields=[
-                ("id", models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-                ("access_type", models.CharField(choices=[("owner","Owner"),("rental_manager","Rental Manager"),("tenant","Tenant"),("guest_submitter","Guest Submitter")], default="owner", max_length=20)),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "access_type",
+                    models.CharField(
+                        choices=[
+                            ("owner", "Owner"),
+                            ("rental_manager", "Rental Manager"),
+                            ("tenant", "Tenant"),
+                            ("guest_submitter", "Guest Submitter"),
+                        ],
+                        default="owner",
+                        max_length=20,
+                    ),
+                ),
                 ("active", models.BooleanField(default=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 ("updated_at", models.DateTimeField(auto_now=True)),
-                ("unit", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="accesses", to="core.unit")),
-                ("user", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="unit_accesses", to=settings.AUTH_USER_MODEL)),
+                (
+                    "unit",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="accesses",
+                        to="core.unit",
+                    ),
+                ),
+                (
+                    "user",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="unit_accesses",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
             options={
                 "verbose_name": "Unit Access",
@@ -336,6 +655,11 @@ class Migration(migrations.Migration):
             },
         ),
     ]
+
+================================================================================
+FILE: accounts/migrations/__init__.py
+================================================================================
+
 
 ================================================================================
 FILE: accounts/models.py
@@ -348,6 +672,7 @@ User = settings.AUTH_USER_MODEL
 
 class Role:
     """Lightweight enum-like constants used in views/permissions."""
+
     PROPERTY_MANAGER = "pm"
     CONCIERGE = "concierge"
     OWNER = "owner"
@@ -382,6 +707,7 @@ class UserProfile(models.Model):
     Per-user role (highest/global role) and optional condo affinity.
     Use UnitAccess for per-unit permissions.
     """
+
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(max_length=20, choices=Role.CHOICES, default=Role.GUEST)
     condo = models.ForeignKey(
@@ -409,9 +735,16 @@ class UnitAccess(models.Model):
     Grants a user access/authority for a specific Unit.
     Useful when the owner uses a third-party rental manager to submit guests.
     """
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="unit_accesses")
-    unit = models.ForeignKey("core.Unit", on_delete=models.CASCADE, related_name="accesses")
-    access_type = models.CharField(max_length=20, choices=AccessType.CHOICES, default=AccessType.OWNER)
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="unit_accesses"
+    )
+    unit = models.ForeignKey(
+        "core.Unit", on_delete=models.CASCADE, related_name="accesses"
+    )
+    access_type = models.CharField(
+        max_length=20, choices=AccessType.CHOICES, default=AccessType.OWNER
+    )
     active = models.BooleanField(default=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -430,35 +763,44 @@ class UnitAccess(models.Model):
 FILE: accounts/permissions.py
 ================================================================================
 # accounts/permissions.py
-from rest_framework.permissions import BasePermission, SAFE_METHODS
+from rest_framework.permissions import SAFE_METHODS, BasePermission
+
 
 def _role(user):
     return getattr(getattr(user, "profile", None), "role", None)
+
 
 class IsAuthenticatedJWT(BasePermission):
     """
     Works with DRF SimpleJWT. If JWT auth is configured in REST_FRAMEWORK,
     request.user will be authenticated when a valid token is provided.
     """
+
     def has_permission(self, request, view):
         return bool(getattr(request, "user", None) and request.user.is_authenticated)
+
 
 class ReadOnly(BasePermission):
     def has_permission(self, request, view):
         return request.method in SAFE_METHODS
 
+
 class IsPropertyManager(BasePermission):
     def has_permission(self, request, view):
         return _role(request.user) == "pm"
+
 
 class IsConcierge(BasePermission):
     def has_permission(self, request, view):
         return _role(request.user) == "con"
 
+
 class IsAgent(BasePermission):
     """Third-party rental manager."""
+
     def has_permission(self, request, view):
         return _role(request.user) == "agent"
+
 
 class IsOwner(BasePermission):
     def has_permission(self, request, view):
@@ -471,7 +813,7 @@ FILE: accounts/serializers.py
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import UserProfile, UnitAccess, Role
+from .models import Role, UnitAccess, UserProfile
 
 User = get_user_model()
 
@@ -493,6 +835,30 @@ class UnitAccessSerializer(serializers.ModelSerializer):
         model = UnitAccess
         fields = ["id", "user", "unit", "access_type", "created_at"]
         read_only_fields = ["id", "created_at"]
+
+================================================================================
+FILE: accounts/signals.py
+================================================================================
+from django.conf import settings
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from .models import UserProfile
+
+User = settings.AUTH_USER_MODEL
+
+
+@receiver(post_save, sender=User)
+def create_profile_for_new_user(sender, instance, created, **kwargs):
+    if created:
+        UserProfile.objects.get_or_create(user=instance)
+
+================================================================================
+FILE: assignments.csv
+================================================================================
+condo_code,unit_number,parking_code,status,effective_start,effective_end
+TSCC1848,1001,P1-002,active,2025-01-01,
+TSCC1848,905,P1-001,active,2025-01-01,
 
 ================================================================================
 FILE: ci_touch.txt
@@ -530,16 +896,19 @@ FILE: condo_backend/settings.py
 """
 Django settings for condo_backend project.
 """
+
 import os
 from datetime import timedelta
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# .env support (optional)
 DOTENV_PATH = BASE_DIR / ".env"
 if DOTENV_PATH.exists():
     try:
         from dotenv import load_dotenv
+
         load_dotenv(DOTENV_PATH)
     except Exception:
         pass
@@ -554,22 +923,23 @@ CSRF_TRUSTED_ORIGINS = (
 )
 
 INSTALLED_APPS = [
+    # Django
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-
     # Third-party
     "rest_framework",
     "corsheaders",
     "django_filters",
-    "drf_spectacular",  # <— docs
-
+    "drf_spectacular",
     # Local
     "accounts",
     "core",
+    # Scheduled jobs
+    "django_crontab",
 ]
 
 MIDDLEWARE = [
@@ -581,6 +951,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # lightweight write audit
+    "core.middleware_audit.AuditWriteMiddleware",
 ]
 
 ROOT_URLCONF = "condo_backend.urls"
@@ -623,7 +995,9 @@ else:
     }
 
 AUTH_PASSWORD_VALIDATORS = [
-    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+    },
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
@@ -644,16 +1018,22 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
-    "DEFAULT_PERMISSION_CLASSES": (
-        "rest_framework.permissions.IsAuthenticated",
-    ),
+    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
     ],
-    # OpenAPI
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    # throttling for login/writes (global rates)
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.AnonRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "user": "200/min",
+        "anon": "50/min",
+    },
 }
 
 SIMPLE_JWT = {
@@ -661,32 +1041,51 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
 }
 
-# drf-spectacular settings (defaults are fine; tweak later)
 SPECTACULAR_SETTINGS = {
     "TITLE": "Condo Backend API",
     "DESCRIPTION": "Parking assignments, short-term bookings, and RBAC.",
     "VERSION": "1.0.0",
     "SERVERS": [{"url": "http://localhost:8000"}],
-    "SWAGGER_UI_DIST": "SIDECAR",  # use drf-spectacular-sidecar
-    "SWAGGER_UI_FAVICON_HREF": "SIDECAR",
-    "REDOC_DIST": "SIDECAR",
+    # If you use drf-spectacular-sidecar, you can set SIDECAR assets here.
+    # Otherwise the defaults are fine.
 }
 
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS / CSRF
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGINS = (
+        os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+        if os.getenv("CORS_ALLOWED_ORIGINS")
+        else []
+    )
 CORS_ALLOW_CREDENTIALS = True
 
 SECURE_BROWSER_XSS_FILTER = True
 SESSION_COOKIE_SECURE = False if DEBUG else True
 CSRF_COOKIE_SECURE = False if DEBUG else True
 
+# nightly CSV export + retention
+ASSIGNMENTS_EXPORT_RETENTION_DAYS = int(
+    os.getenv("ASSIGNMENTS_EXPORT_RETENTION_DAYS", "14")
+)
+ASSIGNMENTS_EXPORT_DIR = os.getenv("ASSIGNMENTS_EXPORT_DIR", str(BASE_DIR / "exports"))
+
+# django-crontab: run at 02:15 UTC daily and hourly reminders
+CRONJOBS = [
+    ("15 2 * * *", "core.cron.nightly_export_and_cleanup"),
+    ("0 * * * *", "core.cron.email_reminders_checkins_outs"),
+]
+
 ================================================================================
 FILE: condo_backend/urls.py
 ================================================================================
-from django.contrib import admin
-from django.urls import path, include
-from django.http import JsonResponse, HttpResponse
 from django.conf import settings
 from django.conf.urls.static import static
+from django.contrib import admin
+from django.http import HttpResponse, JsonResponse
+from django.urls import include, path
 
 # API schema / docs
 from drf_spectacular.views import (
@@ -696,42 +1095,58 @@ from drf_spectacular.views import (
 )
 
 # JWT auth
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
 
 def home(_request):
     return HttpResponse("Condo backend is running")
 
+
 def ping(_request):
     return JsonResponse({"pong": True})
 
+
 def health(_request):
     return JsonResponse({"ok": True})
+
 
 urlpatterns = [
     path("", home),
     path("api/healthz", health),
     path("api/ping", ping),
-
-    # Core API (includes your viewsets + CSV endpoints)
+    # Core API (viewsets + CSV + reports)
     path("api/", include("core.urls")),
-
-    # --- Auth (JWT) ---
+    # Auth (JWT)
     path("api/auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
-
-    # --- OpenAPI / Docs ---
+    # OpenAPI / Docs
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path(
+        "api/docs/",
+        SpectacularSwaggerView.as_view(url_name="schema"),
+        name="swagger-ui",
+    ),
     path("api/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
-
     path("admin/", admin.site.urls),
 ]
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+
+def api_error(request, *args, **kwargs):
+    return JsonResponse(
+        {
+            "error": {
+                "code": "not_found",
+                "detail": "The requested resource was not found.",
+            }
+        },
+        status=404,
+    )
+
+
+handler404 = "condo_backend.urls.api_error"
 
 ================================================================================
 FILE: condo_backend/wsgi.py
@@ -762,7 +1177,10 @@ FILE: core/__init__.py
 FILE: core/admin.py
 ================================================================================
 from django.contrib import admin
-from .models import Condo, Unit, ParkingSpot, UnitParkingAssignment, ShortTermBooking
+from django.utils import timezone
+
+from .models import Condo, ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
+
 
 @admin.register(Condo)
 class CondoAdmin(admin.ModelAdmin):
@@ -772,7 +1190,6 @@ class CondoAdmin(admin.ModelAdmin):
 
 @admin.register(Unit)
 class UnitAdmin(admin.ModelAdmin):
-    # your Unit model uses 'unit_number' (not 'number')
     list_display = ("id", "unit_number", "condo")
     list_filter = ("condo",)
     search_fields = ("unit_number",)
@@ -781,17 +1198,36 @@ class UnitAdmin(admin.ModelAdmin):
 
 @admin.register(ParkingSpot)
 class ParkingSpotAdmin(admin.ModelAdmin):
-    # remove 'status' – your ParkingSpot model doesn’t have it
     list_display = ("id", "code", "condo", "level", "spot_type")
     list_filter = ("condo", "spot_type", "level")
     search_fields = ("code",)
     autocomplete_fields = ("condo",)
 
 
+@admin.action(description="Approve selected bookings")
+def approve_bookings(modeladmin, request, queryset):
+    queryset.update(
+        status="approved", reviewed_by=request.user, reviewed_at=timezone.now()
+    )
+
+
+@admin.action(description="Reject selected bookings")
+def reject_bookings(modeladmin, request, queryset):
+    queryset.update(
+        status="rejected", reviewed_by=request.user, reviewed_at=timezone.now()
+    )
+
+
 @admin.register(UnitParkingAssignment)
 class UnitParkingAssignmentAdmin(admin.ModelAdmin):
-    # your FK is 'parking_spot' (not 'spot'); remove fields that don’t exist
-    list_display = ("id", "unit", "parking_spot", "start_date", "end_date", "is_primary")
+    list_display = (
+        "id",
+        "unit",
+        "parking_spot",
+        "start_date",
+        "end_date",
+        "is_primary",
+    )
     list_filter = ("unit__condo", "is_primary")
     search_fields = ("unit__unit_number", "parking_spot__code")
     autocomplete_fields = ("unit", "parking_spot")
@@ -799,34 +1235,116 @@ class UnitParkingAssignmentAdmin(admin.ModelAdmin):
 
 @admin.register(ShortTermBooking)
 class ShortTermBookingAdmin(admin.ModelAdmin):
-    # booking uses 'unit', 'parking_spot', guest_first_name/guest_last_name
-    list_display = ("id", "unit", "parking_spot", "guest_first_name", "guest_last_name", "check_in", "check_out")
-    list_filter = ("unit__condo",)  # keep minimal; add 'status' or 'id_type' only if they exist on your model
-    search_fields = ("guest_first_name", "guest_last_name", "vehicle_plate", "unit__unit_number", "parking_spot__code")
+    list_display = (
+        "id",
+        "unit",
+        "parking_spot",
+        "guest_first_name",
+        "guest_last_name",
+        "check_in",
+        "check_out",
+        "status",
+    )
+    list_filter = ("unit__condo", "status")
+    search_fields = (
+        "guest_first_name",
+        "guest_last_name",
+        "vehicle_plate",
+        "unit__unit_number",
+        "parking_spot__code",
+    )
     autocomplete_fields = ("unit", "parking_spot")
+    actions = [approve_bookings, reject_bookings]
 
 ================================================================================
 FILE: core/apps.py
 ================================================================================
 from django.apps import AppConfig
 
+
 class CoreConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "core"
+
+================================================================================
+FILE: core/cron.py
+================================================================================
+# core/cron.py
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from django.conf import settings
+from django.core.mail import send_mail
+from django.utils import timezone
+
+from .models import ShortTermBooking
+from .services.csv_roundtrip import export_assignments_csv_text  # defined below
+
+
+def nightly_export_and_cleanup():
+    base = Path(getattr(settings, "ASSIGNMENTS_EXPORT_DIR", "exports"))
+    base.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d")
+    out = base / f"assignments_{ts}.csv"
+    out.write_text(export_assignments_csv_text(), encoding="utf-8")
+
+    # retention
+    keep_days = int(getattr(settings, "ASSIGNMENTS_EXPORT_RETENTION_DAYS", 14))
+    cutoff = timezone.now() - timedelta(days=keep_days)
+    for p in base.glob("assignments_*.csv"):
+        # naive parse: assignments_YYYYMMDD.csv
+        try:
+            d = datetime.strptime(p.stem.split("_")[1], "%Y%m%d")
+            if d < cutoff.replace(tzinfo=None):
+                p.unlink(missing_ok=True)
+        except Exception:
+            continue
+
+
+def email_reminders_checkins_outs():
+    today = timezone.localdate()
+    soon = today + timedelta(days=1)
+    qs_in = ShortTermBooking.objects.filter(check_in=today, status="approved")
+    qs_out = ShortTermBooking.objects.filter(check_out=soon, status="approved")
+    # This is a stub. Replace send_mail with your email backend/config.
+    for b in qs_in:
+        send_mail(
+            subject=f"Reminder: Guest checking in today for {b.unit}",
+            message=f"Guest {b.guest_first_name} {b.guest_last_name} — plate {b.vehicle_plate or 'n/a'}",
+            from_email=os.getenv("DEFAULT_FROM_EMAIL", "noreply@example.com"),
+            recipient_list=[os.getenv("REMINDER_TO_EMAIL", "ops@example.com")],
+            fail_silently=True,
+        )
+    for b in qs_out:
+        send_mail(
+            subject=f"Reminder: Guest checks out tomorrow for {b.unit}",
+            message=f"Booking {b.id} ends {b.check_out.isoformat()}",
+            from_email=os.getenv("DEFAULT_FROM_EMAIL", "noreply@example.com"),
+            recipient_list=[os.getenv("REMINDER_TO_EMAIL", "ops@example.com")],
+            fail_silently=True,
+        )
 
 ================================================================================
 FILE: core/filters.py
 ================================================================================
 # core/filters.py
 import django_filters
+
 from .models import ShortTermBooking
 
 
 class ShortTermBookingFilter(django_filters.FilterSet):
     check_in_after = django_filters.DateFilter(field_name="check_in", lookup_expr="gte")
-    check_in_before = django_filters.DateFilter(field_name="check_in", lookup_expr="lte")
-    check_out_after = django_filters.DateFilter(field_name="check_out", lookup_expr="gte")
-    check_out_before = django_filters.DateFilter(field_name="check_out", lookup_expr="lte")
+    check_in_before = django_filters.DateFilter(
+        field_name="check_in", lookup_expr="lte"
+    )
+    check_out_after = django_filters.DateFilter(
+        field_name="check_out", lookup_expr="gte"
+    )
+    check_out_before = django_filters.DateFilter(
+        field_name="check_out", lookup_expr="lte"
+    )
 
     class Meta:
         model = ShortTermBooking
@@ -960,7 +1478,9 @@ FILE: core/management/commands/check_csv_roundtrip.py
 ================================================================================
 from django.core.management.base import BaseCommand
 from django.utils import timezone
+
 from core.models import UnitParkingAssignment
+
 
 class Command(BaseCommand):
     help = "Sanity check: every active assignment links a unit to a parking spot and vice versa"
@@ -978,15 +1498,20 @@ class Command(BaseCommand):
 ================================================================================
 FILE: core/management/commands/export_assignments_csv.py
 ================================================================================
-from django.core.management.base import BaseCommand
 from pathlib import Path
+
+from django.core.management.base import BaseCommand
+
 from core.services.csv_assignments import export_all_assignments
+
 
 class Command(BaseCommand):
     help = "Export Unit↔Parking assignments to CSV."
 
     def add_arguments(self, parser):
-        parser.add_argument("--out", default="exports/assignments.csv", help="Output CSV path")
+        parser.add_argument(
+            "--out", default="exports/assignments.csv", help="Output CSV path"
+        )
 
     def handle(self, *args, **opts):
         out = Path(opts["out"])
@@ -998,9 +1523,12 @@ class Command(BaseCommand):
 ================================================================================
 FILE: core/management/commands/import_assignments_csv.py
 ================================================================================
-from django.core.management.base import BaseCommand, CommandError
 from pathlib import Path
+
+from django.core.management.base import BaseCommand, CommandError
+
 from core.services.csv_assignments import import_assignments_csv
+
 
 class Command(BaseCommand):
     help = "Import/Upsert Unit↔Parking assignments from CSV."
@@ -1020,16 +1548,20 @@ class Command(BaseCommand):
 ================================================================================
 FILE: core/management/commands/load_sample_data.py
 ================================================================================
-from django.core.management.base import BaseCommand, CommandError
-from django.core.management import call_command
-from django.apps import apps
 from pathlib import Path
+
+from django.apps import apps
+from django.core.management import call_command
+from django.core.management.base import BaseCommand, CommandError
+
 
 class Command(BaseCommand):
     help = "Load sample data fixtures for local/CI runs"
 
     def add_arguments(self, parser):
-        parser.add_argument("--flush", action="store_true", help="Flush DB before loading fixtures")
+        parser.add_argument(
+            "--flush", action="store_true", help="Flush DB before loading fixtures"
+        )
 
     def handle(self, *args, **opts):
         core_path = Path(apps.get_app_config("core").path)
@@ -1044,6 +1576,56 @@ class Command(BaseCommand):
         self.stdout.write(f"Loading fixture: {fixture_path}")
         call_command("loaddata", str(fixture_path))
         self.stdout.write(self.style.SUCCESS("Sample data loaded."))
+
+================================================================================
+FILE: core/middleware_audit.py
+================================================================================
+# core/middleware_audit.py
+import json
+from datetime import datetime
+
+from django.conf import settings
+from django.http import HttpRequest
+from django.utils.deprecation import MiddlewareMixin
+
+
+class AuditWriteMiddleware(MiddlewareMixin):
+    """
+    VERY simple file-based audit for POST/PUT/PATCH/DELETE.
+    Writes newline-delimited JSON to MEDIA_ROOT/audit/audit.log
+    (Swap to a DB model later if needed.)
+    """
+
+    def process_response(self, request: HttpRequest, response):
+        if request.method in (
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        ) and request.path.startswith("/api/"):
+            try:
+                body = request.body.decode("utf-8")[:4096]
+            except Exception:
+                body = "<unreadable>"
+            line = {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "path": request.path,
+                "method": request.method,
+                "status": response.status_code,
+                "user": getattr(getattr(request, "user", None), "username", None),
+                "ip": request.META.get("REMOTE_ADDR"),
+                "body": body,
+            }
+            try:
+                import os
+
+                base = os.path.join(getattr(settings, "MEDIA_ROOT", "media"), "audit")
+                os.makedirs(base, exist_ok=True)
+                with open(os.path.join(base, "audit.log"), "a", encoding="utf-8") as f:
+                    f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+        return response
 
 ================================================================================
 FILE: core/migrations/0001_initial.py
@@ -1368,19 +1950,30 @@ class Migration(migrations.Migration):
             field=models.DateTimeField(default=timezone.now, auto_now=True),
             preserve_default=False,
         ),
-
         # Don’t try to DROP columns in SQLite that never existed.
         # Update Django state only so future migrations stay consistent.
         migrations.SeparateDatabaseAndState(
             state_operations=[
                 migrations.RemoveField(model_name="parkingspot", name="notes"),
-                migrations.RemoveField(model_name="shorttermbooking", name="approved_at"),
-                migrations.RemoveField(model_name="shorttermbooking", name="approved_by"),
-                migrations.RemoveField(model_name="shorttermbooking", name="created_by_email"),
-                migrations.RemoveField(model_name="shorttermbooking", name="guest_email"),
-                migrations.RemoveField(model_name="shorttermbooking", name="guest_phone"),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="approved_at"
+                ),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="approved_by"
+                ),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="created_by_email"
+                ),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="guest_email"
+                ),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="guest_phone"
+                ),
                 migrations.RemoveField(model_name="shorttermbooking", name="id_city"),
-                migrations.RemoveField(model_name="shorttermbooking", name="num_guests"),
+                migrations.RemoveField(
+                    model_name="shorttermbooking", name="num_guests"
+                ),
             ]
         ),
     ]
@@ -1440,27 +2033,37 @@ class Migration(migrations.Migration):
                 migrations.AddField(
                     model_name="shorttermbooking",
                     name="approved_by",
-                    field=models.CharField(max_length=255, null=True, blank=True, default=""),
+                    field=models.CharField(
+                        max_length=255, null=True, blank=True, default=""
+                    ),
                 ),
                 migrations.AddField(
                     model_name="shorttermbooking",
                     name="created_by_email",
-                    field=models.CharField(max_length=255, null=True, blank=True, default=""),
+                    field=models.CharField(
+                        max_length=255, null=True, blank=True, default=""
+                    ),
                 ),
                 migrations.AddField(
                     model_name="shorttermbooking",
                     name="guest_email",
-                    field=models.CharField(max_length=255, null=True, blank=True, default=""),
+                    field=models.CharField(
+                        max_length=255, null=True, blank=True, default=""
+                    ),
                 ),
                 migrations.AddField(
                     model_name="shorttermbooking",
                     name="guest_phone",
-                    field=models.CharField(max_length=50, null=True, blank=True, default=""),
+                    field=models.CharField(
+                        max_length=50, null=True, blank=True, default=""
+                    ),
                 ),
                 migrations.AddField(
                     model_name="shorttermbooking",
                     name="id_city",
-                    field=models.CharField(max_length=255, null=True, blank=True, default=""),
+                    field=models.CharField(
+                        max_length=255, null=True, blank=True, default=""
+                    ),
                 ),
                 migrations.AddField(
                     model_name="shorttermbooking",
@@ -1470,7 +2073,6 @@ class Migration(migrations.Migration):
             ],
             database_operations=[],
         ),
-
         # 2) Now actually remove them (DB operation). On SQLite this rebuilds the table
         # without these columns, eliminating NOT NULL constraints left behind.
         migrations.RemoveField(model_name="shorttermbooking", name="approved_at"),
@@ -1485,9 +2087,9 @@ class Migration(migrations.Migration):
 ================================================================================
 FILE: core/migrations/0008_booking_workflow_and_file.py
 ================================================================================
+import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
-import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
@@ -1565,6 +2167,7 @@ from django.db import models
 class TimeStampedModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
     class Meta:
         abstract = True
 
@@ -1590,7 +2193,9 @@ class Unit(TimeStampedModel):
     unit_number = models.CharField(max_length=50)
     owner_name = models.CharField(max_length=200, blank=True)
     owner_email = models.EmailField(blank=True)
-    status = models.CharField(max_length=32, choices=Status.choices, default=Status.OWNER_OCCUPIED)
+    status = models.CharField(
+        max_length=32, choices=Status.choices, default=Status.OWNER_OCCUPIED
+    )
 
     class Meta:
         unique_together = ("condo", "unit_number")
@@ -1604,10 +2209,14 @@ class ParkingSpot(TimeStampedModel):
         RESIDENT = "RESIDENT", "Resident"
         VISITOR = "VISITOR", "Visitor"
 
-    condo = models.ForeignKey(Condo, on_delete=models.CASCADE, related_name="parking_spots")
+    condo = models.ForeignKey(
+        Condo, on_delete=models.CASCADE, related_name="parking_spots"
+    )
     code = models.CharField(max_length=50)  # e.g., P1-123
     level = models.CharField(max_length=50, blank=True)
-    spot_type = models.CharField(max_length=16, choices=SpotType.choices, default=SpotType.RESIDENT)
+    spot_type = models.CharField(
+        max_length=16, choices=SpotType.choices, default=SpotType.RESIDENT
+    )
 
     class Meta:
         unique_together = ("condo", "code")
@@ -1617,8 +2226,12 @@ class ParkingSpot(TimeStampedModel):
 
 
 class UnitParkingAssignment(TimeStampedModel):
-    unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name="parking_assignments")
-    parking_spot = models.ForeignKey(ParkingSpot, on_delete=models.CASCADE, related_name="assignments")
+    unit = models.ForeignKey(
+        Unit, on_delete=models.CASCADE, related_name="parking_assignments"
+    )
+    parking_spot = models.ForeignKey(
+        ParkingSpot, on_delete=models.CASCADE, related_name="assignments"
+    )
     start_date = models.DateField()
     end_date = models.DateField(null=True, blank=True)  # open-ended
     is_primary = models.BooleanField(default=True)
@@ -1648,7 +2261,9 @@ class ShortTermBooking(TimeStampedModel):
     # guest info
     guest_first_name = models.CharField(max_length=120)
     guest_last_name = models.CharField(max_length=120)
-    id_type = models.CharField(max_length=16, choices=IdType.choices, default=IdType.LICENSE)
+    id_type = models.CharField(
+        max_length=16, choices=IdType.choices, default=IdType.LICENSE
+    )
     id_number = models.CharField(max_length=120, blank=True)
     id_country = models.CharField(max_length=120, blank=True)
     id_province_state = models.CharField(max_length=120, blank=True)
@@ -1656,22 +2271,36 @@ class ShortTermBooking(TimeStampedModel):
     # vehicle & parking
     vehicle_plate = models.CharField(max_length=50, blank=True)
     parking_spot = models.ForeignKey(
-        ParkingSpot, on_delete=models.SET_NULL, null=True, blank=True, related_name="bookings"
+        ParkingSpot,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bookings",
     )
 
     # stay dates (date granularity is fine)
     check_in = models.DateField()
     check_out = models.DateField()
 
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING
+    )
     notes = models.TextField(blank=True)
 
     # RBAC workflow tracking (matches serializer)
     submitted_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="bookings_submitted"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bookings_submitted",
     )
     reviewed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="bookings_reviewed"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bookings_reviewed",
     )
     reviewed_at = models.DateTimeField(null=True, blank=True)
 
@@ -1690,7 +2319,8 @@ FILE: core/serializers.py
 # core/serializers.py
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
-from .models import Condo, Unit, ParkingSpot, UnitParkingAssignment, ShortTermBooking
+
+from .models import Condo, ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
 
 User = get_user_model()
 
@@ -1759,7 +2389,9 @@ class UnitParkingAssignmentSerializer(serializers.ModelSerializer):
         unit = attrs.get("unit") or getattr(self.instance, "unit", None)
         spot = attrs.get("parking_spot") or getattr(self.instance, "parking_spot", None)
         if unit and spot and unit.condo_id != spot.condo_id:
-            raise serializers.ValidationError("Unit and Parking Spot must belong to the same condo.")
+            raise serializers.ValidationError(
+                "Unit and Parking Spot must belong to the same condo."
+            )
         return attrs
 
 
@@ -1768,8 +2400,12 @@ class ShortTermBookingSerializer(serializers.ModelSerializer):
     spot_display = serializers.CharField(source="parking_spot.__str__", read_only=True)
 
     # RBAC workflow fields
-    submitted_by_username = serializers.CharField(source="submitted_by.username", read_only=True)
-    reviewed_by_username = serializers.CharField(source="reviewed_by.username", read_only=True)
+    submitted_by_username = serializers.CharField(
+        source="submitted_by.username", read_only=True
+    )
+    reviewed_by_username = serializers.CharField(
+        source="reviewed_by.username", read_only=True
+    )
     id_document = serializers.FileField(required=False, allow_null=True)
 
     class Meta:
@@ -1815,12 +2451,16 @@ class ShortTermBookingSerializer(serializers.ModelSerializer):
         check_in = attrs.get("check_in") or getattr(self.instance, "check_in", None)
         check_out = attrs.get("check_out") or getattr(self.instance, "check_out", None)
         if check_in and check_out and check_out < check_in:
-            raise serializers.ValidationError("check_out must be the same day or after check_in.")
+            raise serializers.ValidationError(
+                "check_out must be the same day or after check_in."
+            )
 
         unit = attrs.get("unit") or getattr(self.instance, "unit", None)
         spot = attrs.get("parking_spot") or getattr(self.instance, "parking_spot", None)
         if unit and spot and unit.condo_id != spot.condo_id:
-            raise serializers.ValidationError("Selected parking spot must belong to the same condo as the unit.")
+            raise serializers.ValidationError(
+                "Selected parking spot must belong to the same condo as the unit."
+            )
         return attrs
 
     def create(self, validated_data):
@@ -1831,10 +2471,323 @@ class ShortTermBookingSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 ================================================================================
+FILE: core/services/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: core/services/csv_assignments.py
+================================================================================
+import csv
+import io
+from datetime import date, datetime
+from typing import Any, Dict, List, Tuple
+
+from django.db import transaction
+
+from core.models import Condo, ParkingSpot, Unit, UnitParkingAssignment
+
+CSV_FIELDS_EXPORT = [
+    "condo_code",
+    "unit_number",
+    "parking_code",
+    "status",  # derived: active / inactive
+    "effective_start",
+    "effective_end",
+]
+
+# We’ll accept either start_date/end_date OR effective_start/effective_end on import
+CSV_FIELDS_IMPORT_ALLOWED = {
+    "condo_code",
+    "unit_number",
+    "parking_code",
+    "is_primary",
+    "start_date",
+    "end_date",
+    "effective_start",
+    "effective_end",
+    "status",  # ignored if present (we compute it)
+}
+
+
+def _parse_date(val: str):
+    """
+    Accepts: YYYY-MM-DD, empty/None. Returns date or None.
+    """
+    if not val:
+        return None
+    val = str(val).strip()
+    if not val:
+        return None
+    # try ISO format first
+    try:
+        return datetime.strptime(val, "%Y-%m-%d").date()
+    except Exception:
+        # last resort: let fromisoformat try (can raise)
+        return date.fromisoformat(val)
+
+
+def export_assignments_to_csv() -> Tuple[str, bytes]:
+    """
+    Build a canonical CSV of current assignments.
+
+    Columns:
+      condo_code, unit_number, parking_code, status, effective_start, effective_end
+    - status is computed: 'active' if end is None or >= today; else 'inactive'
+    """
+    rows: List[List[str]] = []
+    today = date.today()
+
+    # Select related for speed
+    qs = UnitParkingAssignment.objects.select_related(
+        "unit__condo", "parking_spot__condo"
+    ).order_by(
+        "unit__condo__code",
+        "unit__unit_number",
+        "parking_spot__code",
+        "start_date",
+    )
+
+    for a in qs:
+        condo_code = a.unit.condo.code  # unit & spot share condo by validation
+        unit_number = a.unit.unit_number
+        parking_code = a.parking_spot.code
+        eff_start = a.start_date.isoformat() if a.start_date else ""
+        eff_end = a.end_date.isoformat() if a.end_date else ""
+        is_active = (a.end_date is None) or (a.end_date >= today)
+        status = "active" if is_active else "inactive"
+
+        rows.append([condo_code, unit_number, parking_code, status, eff_start, eff_end])
+
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_FIELDS_EXPORT)
+    writer.writerows(rows)
+
+    content_bytes = buffer.getvalue().encode("utf-8")
+    filename = "assignments.csv"
+    return filename, content_bytes
+
+
+@transaction.atomic
+def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
+    """
+    Upsert assignments from a CSV file.
+
+    Accepted headers (case-sensitive):
+      required: condo_code, unit_number, parking_code
+      optional: is_primary, start_date, end_date OR effective_start, effective_end
+      optional: status (ignored; we compute status from dates)
+
+    Behavior:
+      - For (condo_code, unit_number, parking_code) find related models.
+      - If a UnitParkingAssignment with that (unit, parking_spot) exists, update fields.
+      - Else create a new assignment.
+      - We do NOT delete/archive missing rows in this basic import (keeps it safe).
+
+    Returns:
+      {
+        "created": int,
+        "updated": int,
+        "errors": int,
+        "error_rows": [ {"row_number": n, "error": "...", "row": {...}}, ... ],
+        "total_rows": int
+      }
+    """
+    # Handle InMemoryUploadedFile / TemporaryUploadedFile and plain file-like objects
+    if hasattr(uploaded_file, "read"):
+        raw = uploaded_file.read()
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8-sig")
+        else:
+            text = raw
+    else:
+        # If someone passed us path or bytes
+        text = (
+            uploaded_file.decode("utf-8-sig")
+            if isinstance(uploaded_file, (bytes, bytearray))
+            else str(uploaded_file)
+        )
+
+    f = io.StringIO(text)
+    reader = csv.DictReader(f)
+
+    # Validate headers
+    field_set = set(reader.fieldnames or [])
+    missing = {"condo_code", "unit_number", "parking_code"} - field_set
+    if missing:
+        return {
+            "created": 0,
+            "updated": 0,
+            "errors": 1,
+            "error_rows": [
+                {
+                    "row_number": 0,
+                    "error": f"Missing required columns: {', '.join(sorted(missing))}",
+                    "row": {},
+                }
+            ],
+            "total_rows": 0,
+        }
+
+    # Extra unknown fields? Not fatal; we simply ignore them.
+    # (No temp variables here to satisfy flake8 F841.)
+    # unknown = field_set - CSV_FIELDS_IMPORT_ALLOWED  # ignored
+
+    created = 0
+    updated = 0
+    errors = 0
+    error_rows: List[Dict[str, Any]] = []
+    total = 0
+
+    for idx, row in enumerate(reader, start=2):  # header is line 1
+        total += 1
+        try:
+            condo_code = (row.get("condo_code") or "").strip()
+            unit_number = (row.get("unit_number") or "").strip()
+            parking_code = (row.get("parking_code") or "").strip()
+            is_primary_raw = (row.get("is_primary") or "").strip()
+
+            # pick date fields from either {start_date,end_date} or {effective_start,effective_end}
+            start_raw = (
+                row.get("start_date") or row.get("effective_start") or ""
+            ).strip()
+            end_raw = (row.get("end_date") or row.get("effective_end") or "").strip()
+
+            if not (condo_code and unit_number and parking_code):
+                raise ValueError("condo_code, unit_number, parking_code are required")
+
+            try:
+                condo = Condo.objects.get(code=condo_code)
+            except Condo.DoesNotExist:
+                raise ValueError(f"Condo not found: code={condo_code}")
+
+            try:
+                unit = Unit.objects.get(condo=condo, unit_number=unit_number)
+            except Unit.DoesNotExist:
+                raise ValueError(
+                    f"Unit not found: condo={condo_code} unit_number={unit_number}"
+                )
+
+            try:
+                spot = ParkingSpot.objects.get(condo=condo, code=parking_code)
+            except ParkingSpot.DoesNotExist:
+                raise ValueError(
+                    f"Parking spot not found: condo={condo_code} code={parking_code}"
+                )
+
+            # parse flags/dates
+            is_primary = None
+            if is_primary_raw != "":
+                is_primary = str(is_primary_raw).lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "t",
+                }
+
+            start_date = _parse_date(start_raw) if start_raw else None
+            end_date = _parse_date(end_raw) if end_raw else None
+
+            # upsert by (unit, parking_spot)
+            obj, existed = UnitParkingAssignment.objects.get_or_create(
+                unit=unit,
+                parking_spot=spot,
+                defaults={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "is_primary": bool(is_primary) if is_primary is not None else False,
+                },
+            )
+            if existed:
+                created += 1
+            else:
+                changed = False
+                # Only update fields that were provided (leave others intact)
+                if start_date is not None and obj.start_date != start_date:
+                    obj.start_date = start_date
+                    changed = True
+                if end_date is not None and obj.end_date != end_date:
+                    obj.end_date = end_date
+                    changed = True
+                if is_primary is not None and obj.is_primary != bool(is_primary):
+                    obj.is_primary = bool(is_primary)
+                    changed = True
+                if changed:
+                    obj.save(update_fields=["start_date", "end_date", "is_primary"])
+                    updated += 1
+
+        except Exception as e:
+            errors += 1
+            error_rows.append(
+                {
+                    "row_number": idx,
+                    "error": str(e),
+                    "row": row,
+                }
+            )
+
+    return {
+        "created": created,
+        "updated": updated,
+        "errors": errors,
+        "error_rows": error_rows,
+        "total_rows": total,
+    }
+
+================================================================================
+FILE: core/services/csv_roundtrip.py
+================================================================================
+# core/services/csv_roundtrip.py
+import csv
+from io import StringIO
+
+from .models import UnitParkingAssignment
+
+CSV_HEADERS = [
+    "condo_code",
+    "unit_number",
+    "spot_code",
+    "start_date",
+    "end_date",
+    "is_primary",
+]
+
+
+def export_assignments_csv_text() -> str:
+    out = StringIO()
+    w = csv.writer(out)
+    w.writerow(CSV_HEADERS)
+    qs = UnitParkingAssignment.objects.select_related(
+        "unit__condo", "parking_spot__condo"
+    ).order_by("unit__condo__code", "unit__unit_number", "-start_date")
+    for a in qs:
+        w.writerow(
+            [
+                a.unit.condo.code,
+                a.unit.unit_number,
+                a.parking_spot.code,
+                a.start_date.isoformat(),
+                a.end_date.isoformat() if a.end_date else "",
+                str(a.is_primary).lower(),
+            ]
+        )
+    return out.getvalue()
+
+================================================================================
 FILE: core/tests/test_fixture_smoke.py
 ================================================================================
 from django.test import TestCase
-from core.models import Condo, Unit, ParkingSpot, UnitParkingAssignment, ShortTermBooking
+
+from core.models import (
+    Condo,
+    ParkingSpot,
+    ShortTermBooking,
+    Unit,
+    UnitParkingAssignment,
+)
+
 
 class FixtureSmokeTests(TestCase):
     fixtures = ["sample_data.json"]
@@ -1853,8 +2806,9 @@ class FixtureSmokeTests(TestCase):
 ================================================================================
 FILE: core/tests.py
 ================================================================================
-from django.test import TestCase
 from django.apps import apps
+from django.test import TestCase
+
 
 class SmokeTest(TestCase):
     def test_core_app_loaded(self):
@@ -1863,12 +2817,16 @@ class SmokeTest(TestCase):
 ================================================================================
 FILE: core/urls.py
 ================================================================================
-from django.urls import path, include
+# core/urls.py (only add the last two lines shown)
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
-    CondoViewSet, UnitViewSet, ParkingSpotViewSet,
-    UnitParkingAssignmentViewSet, ShortTermBookingViewSet
+    CondoViewSet,
+    ParkingSpotViewSet,
+    ShortTermBookingViewSet,
+    UnitParkingAssignmentViewSet,
+    UnitViewSet,
 )
 from .views_assignments_csv import AssignmentsCSVExportView, AssignmentsCSVImportView
 
@@ -1876,13 +2834,36 @@ router = DefaultRouter()
 router.register(r"condos", CondoViewSet, basename="condo")
 router.register(r"units", UnitViewSet, basename="unit")
 router.register(r"parking-spots", ParkingSpotViewSet, basename="parkingspot")
-router.register(r"unit-parking-assignments", UnitParkingAssignmentViewSet, basename="unitparkingassignment")
+router.register(
+    r"unit-parking-assignments",
+    UnitParkingAssignmentViewSet,
+    basename="unitparkingassignment",
+)
 router.register(r"bookings", ShortTermBookingViewSet, basename="booking")
 
 urlpatterns = [
     path("", include(router.urls)),
     path("assignments/export.csv", AssignmentsCSVExportView.as_view()),
     path("assignments/import.csv", AssignmentsCSVImportView.as_view()),
+    path("reports/", include("core.urls_reports")),  # <-- add this line
+]
+
+================================================================================
+FILE: core/urls_reports.py
+================================================================================
+# core/urls_reports.py
+from django.urls import path
+
+from .views_reports import (
+    AvailableSpotsReportView,
+    UnitBookingsReportView,
+    UpcomingCheckpointsReportView,
+)
+
+urlpatterns = [
+    path("unit/<int:unit_id>/bookings", UnitBookingsReportView.as_view()),
+    path("available-spots", AvailableSpotsReportView.as_view()),
+    path("upcoming-checkpoints", UpcomingCheckpointsReportView.as_view()),
 ]
 
 ================================================================================
@@ -1890,24 +2871,27 @@ FILE: core/views.py
 ================================================================================
 # core/views.py
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import viewsets, permissions, status
+from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from accounts.models import Role, UnitAccess
 from accounts.permissions import (
-    IsAuthenticatedJWT, IsPropertyManager, IsConcierge, ReadOnly
+    IsAuthenticatedJWT,
+    IsConcierge,
+    IsPropertyManager,
+    ReadOnly,
 )
 
-from .models import Condo, Unit, ParkingSpot, UnitParkingAssignment, ShortTermBooking
+from .filters import ShortTermBookingFilter
+from .models import Condo, ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
 from .serializers import (
     CondoSerializer,
-    UnitSerializer,
     ParkingSpotSerializer,
-    UnitParkingAssignmentSerializer,
     ShortTermBookingSerializer,
+    UnitParkingAssignmentSerializer,
+    UnitSerializer,
 )
-from .filters import ShortTermBookingFilter
 
 
 # ----- helpers -----
@@ -1961,11 +2945,9 @@ class UnitParkingAssignmentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         units = user_units_qs(self.request.user)
-        return (
-            UnitParkingAssignment.objects
-            .select_related("unit", "parking_spot")
-            .filter(unit__in=units)
-        )
+        return UnitParkingAssignment.objects.select_related(
+            "unit", "parking_spot"
+        ).filter(unit__in=units)
 
 
 class ShortTermBookingViewSet(viewsets.ModelViewSet):
@@ -1984,7 +2966,14 @@ class ShortTermBookingViewSet(viewsets.ModelViewSet):
         if role == Role.PROPERTY_MANAGER:
             return [IsAuthenticatedJWT()]
         if role == Role.CONCIERGE:
-            if self.action in ["list", "retrieve", "update", "partial_update", "approve", "reject"]:
+            if self.action in [
+                "list",
+                "retrieve",
+                "update",
+                "partial_update",
+                "approve",
+                "reject",
+            ]:
                 return [IsAuthenticatedJWT()]
             return [IsAuthenticatedJWT(), ReadOnly()]
         # agents/owners
@@ -1995,7 +2984,9 @@ class ShortTermBookingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         role = getattr(getattr(user, "profile", None), "role", None)
-        qs = ShortTermBooking.objects.select_related("unit", "parking_spot", "submitted_by", "reviewed_by")
+        qs = ShortTermBooking.objects.select_related(
+            "unit", "parking_spot", "submitted_by", "reviewed_by"
+        )
         if role in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
             return qs
         units = user_units_qs(user)
@@ -2016,38 +3007,53 @@ class ShortTermBookingViewSet(viewsets.ModelViewSet):
         booking = self.get_object()
         role = getattr(getattr(request.user, "profile", None), "role", None)
         if role not in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
-            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN
+            )
         booking.status = "approved"
         booking.reviewed_by = request.user
         from django.utils import timezone
+
         booking.reviewed_at = timezone.now()
         booking.save(update_fields=["status", "reviewed_by", "reviewed_at"])
-        return Response(ShortTermBookingSerializer(booking, context={"request": request}).data)
+        return Response(
+            ShortTermBookingSerializer(booking, context={"request": request}).data
+        )
 
     @action(detail=True, methods=["POST"])
     def reject(self, request, pk=None):
         booking = self.get_object()
         role = getattr(getattr(request.user, "profile", None), "role", None)
         if role not in [Role.PROPERTY_MANAGER, Role.CONCIERGE]:
-            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN
+            )
         booking.status = "rejected"
         booking.reviewed_by = request.user
         from django.utils import timezone
+
         booking.reviewed_at = timezone.now()
         booking.save(update_fields=["status", "reviewed_by", "reviewed_at"])
-        return Response(ShortTermBookingSerializer(booking, context={"request": request}).data)
+        return Response(
+            ShortTermBookingSerializer(booking, context={"request": request}).data
+        )
 
 ================================================================================
 FILE: core/views_assignments_csv.py
 ================================================================================
 # core/views_assignments_csv.py
 from django.http import HttpResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from accounts.permissions import IsAuthenticatedJWT, IsPropertyManager
-from .services.csv_assignments import export_assignments_to_csv, import_assignments_from_csv
+
+from .services.csv_assignments import (
+    export_assignments_to_csv,
+    import_assignments_from_csv,
+)
+
 
 class AssignmentsCSVExportView(APIView):
     permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
@@ -2062,6 +3068,7 @@ class AssignmentsCSVExportView(APIView):
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
 
+
 class AssignmentsCSVImportView(APIView):
     permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
 
@@ -2071,10 +3078,215 @@ class AssignmentsCSVImportView(APIView):
         """
         csv_file = request.FILES.get("file")
         if not csv_file:
-            return Response({"detail": "Missing 'file'."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Missing 'file'."}, status=status.HTTP_400_BAD_REQUEST
+            )
 
         result = import_assignments_from_csv(csv_file)
         return Response(result, status=status.HTTP_200_OK)
+
+================================================================================
+FILE: core/views_reports.py
+================================================================================
+# core/views_reports.py
+from datetime import date, timedelta
+
+from django.db.models import Q
+from django.utils.dateparse import parse_date
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.permissions import IsAuthenticatedJWT
+
+from .models import ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
+
+
+def _parse_window(window_param: str) -> timedelta:
+    # e.g., "7d" -> 7 days
+    if not window_param:
+        return timedelta(days=7)
+    try:
+        if window_param.endswith("d"):
+            return timedelta(days=int(window_param[:-1]))
+        return timedelta(days=int(window_param))
+    except Exception:
+        return timedelta(days=7)
+
+
+class UnitBookingsReportView(APIView):
+    """
+    GET /reports/unit/{id}/bookings
+    Returns bookings for a unit (past + upcoming, newest first).
+    Query params:
+      - status (optional): pending|approved|rejected|cancelled
+    """
+
+    permission_classes = [IsAuthenticatedJWT]
+
+    def get(self, request, unit_id: int, *args, **kwargs):
+        try:
+            unit = Unit.objects.get(pk=unit_id)
+        except Unit.DoesNotExist:
+            return Response(
+                {"detail": "Unit not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        qs = (
+            ShortTermBooking.objects.select_related("unit", "parking_spot")
+            .filter(unit=unit)
+            .order_by("-check_in", "-created_at")
+        )
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        data = [
+            {
+                "id": b.id,
+                "unit": str(b.unit),
+                "parking_spot": str(b.parking_spot) if b.parking_spot_id else None,
+                "guest_first_name": b.guest_first_name,
+                "guest_last_name": b.guest_last_name,
+                "vehicle_plate": b.vehicle_plate,
+                "check_in": b.check_in.isoformat(),
+                "check_out": b.check_out.isoformat(),
+                "status": b.status,
+                "notes": b.notes,
+            }
+            for b in qs
+        ]
+        return Response({"unit": str(unit), "count": len(data), "results": data})
+
+
+class AvailableSpotsReportView(APIView):
+    """
+    GET /reports/available-spots?date=YYYY-MM-DD&condo_id=<id>
+    Lists resident spots in a condo that are NOT assigned on that date and NOT booked for that date.
+    """
+
+    permission_classes = [IsAuthenticatedJWT]
+
+    def get(self, request, *args, **kwargs):
+        d_str = request.query_params.get("date")
+        condo_id = request.query_params.get("condo_id")
+        d = parse_date(d_str) if d_str else date.today()
+        if not d:
+            return Response(
+                {"detail": "Invalid date."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if not condo_id:
+            return Response(
+                {"detail": "Missing condo_id."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Spots in the condo
+        spots = ParkingSpot.objects.filter(condo_id=condo_id)
+
+        # Spots assigned on the date (active assignment range includes d)
+        active_assignments = UnitParkingAssignment.objects.filter(
+            parking_spot__in=spots,
+            start_date__lte=d,
+        ).filter(Q(end_date__isnull=True) | Q(end_date__gte=d))
+        assigned_spot_ids = set(
+            active_assignments.values_list("parking_spot_id", flat=True)
+        )
+
+        # Spots booked for the date (inclusive overlap)
+        day_q = Q(check_in__lte=d, check_out__gte=d)
+        day_booked_spot_ids = set(
+            ShortTermBooking.objects.filter(parking_spot__in=spots)
+            .filter(day_q)
+            .values_list("parking_spot_id", flat=True)
+        )
+
+        unavailable = assigned_spot_ids.union(day_booked_spot_ids)
+        available = spots.exclude(id__in=unavailable).order_by("code")
+
+        results = [
+            {"id": s.id, "spot": str(s), "code": s.code, "level": s.level}
+            for s in available
+        ]
+        return Response(
+            {
+                "date": d.isoformat(),
+                "condo_id": int(condo_id),
+                "count": len(results),
+                "results": results,
+            }
+        )
+
+
+class UpcomingCheckpointsReportView(APIView):
+    """
+    GET /reports/upcoming-checkpoints?window=7d
+    Returns bookings starting within the next 'window' days.
+    """
+
+    permission_classes = [IsAuthenticatedJWT]
+
+    def get(self, request, *args, **kwargs):
+        window = _parse_window(request.query_params.get("window"))
+        today = date.today()
+        end = today + window
+        qs = (
+            ShortTermBooking.objects.select_related("unit", "parking_spot")
+            .filter(check_in__gte=today, check_in__lte=end)
+            .order_by("check_in", "unit__unit_number")
+        )
+        data = [
+            {
+                "id": b.id,
+                "check_in": b.check_in.isoformat(),
+                "check_out": b.check_out.isoformat(),
+                "unit": str(b.unit),
+                "parking_spot": str(b.parking_spot) if b.parking_spot_id else None,
+                "guest": f"{b.guest_first_name} {b.guest_last_name}",
+                "status": b.status,
+            }
+            for b in qs
+        ]
+        return Response(
+            {"window_days": window.days, "count": len(data), "results": data}
+        )
+
+================================================================================
+FILE: docker-compose.yml
+================================================================================
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    build: .
+    command: gunicorn condo_backend.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120
+    environment:
+      DJANGO_SETTINGS_MODULE: condo_backend.settings
+      DB_ENGINE: postgres
+      DB_NAME: app
+      DB_USER: app
+      DB_PASSWORD: apppass
+      DB_HOST: db
+      DB_PORT: "5432"
+      SECRET_KEY: dev-secret-change-me
+      DEBUG: "True"
+      ALLOWED_HOSTS: "*"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
 
 ================================================================================
 FILE: export_repo_to_text.py
@@ -2105,9 +3317,10 @@ Notes:
   - Falls back to walking the directory if Git is unavailable.
 """
 from __future__ import annotations
+
 import os
-import sys
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Iterable
@@ -2119,21 +3332,64 @@ DEFAULT_OUTPUT = "repo_dump.txt"
 
 SKIP_NAMES = {".DS_Store", "Thumbs.db"}
 SKIP_DIRS = {
-    ".git", ".hg", ".svn", ".idea", ".vscode", ".venv", "venv", "__pycache__", "node_modules",
-    "dist", "build", "staticfiles", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    "staticfiles",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
 }
 SKIP_SUFFIXES = {
-    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib",
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
-    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
-    ".mp3", ".wav", ".mp4", ".mov", ".avi",
-    ".sqlite", ".sqlite3", ".db",
+    ".pyc",
+    ".pyo",
+    ".pyd",
+    ".so",
+    ".dll",
+    ".dylib",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".mp3",
+    ".wav",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
 }
 SENSITIVE_BASENAMES = {".env", ".env.local", ".envrc", ".secrets", "secrets.json"}
 
 
 def sh(args, check=True, text=True):
-    return subprocess.run(args, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=text)
+    return subprocess.run(
+        args,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+        text=text,
+    )
 
 
 def parse_args(argv):
@@ -2148,7 +3404,8 @@ def parse_args(argv):
 
     i = 0
     if i < len(argv) and not argv[i].startswith("-"):
-        out_path = Path(argv[i]); i += 1
+        out_path = Path(argv[i])
+        i += 1
     while i < len(argv):
         a = argv[i]
         if a == "--max-bytes" and i + 1 < len(argv):
@@ -2156,24 +3413,43 @@ def parse_args(argv):
                 max_bytes = int(argv[i + 1])
             except ValueError:
                 pass
-            i += 2; continue
+            i += 2
+            continue
         if a == "--include-sensitive":
-            include_sensitive = True; i += 1; continue
+            include_sensitive = True
+            i += 1
+            continue
         if a == "--include-binaries":
-            include_binaries = True; i += 1; continue
+            include_binaries = True
+            i += 1
+            continue
         if a == "--autocommit":
-            autocommit = True; i += 1; continue
+            autocommit = True
+            i += 1
+            continue
         if a == "--commit-message" and i + 1 < len(argv):
-            commit_message = argv[i + 1]; i += 2; continue
+            commit_message = argv[i + 1]
+            i += 2
+            continue
         if a == "--git-include-ignored":
-            git_include_ignored = True; i += 1; continue
+            git_include_ignored = True
+            i += 1
+            continue
         if a == "--git-init":
-            git_init = True; i += 1; continue
+            git_init = True
+            i += 1
+            continue
         i += 1
 
     return (
-        out_path, max_bytes, include_sensitive, include_binaries,
-        autocommit, commit_message, git_include_ignored, git_init
+        out_path,
+        max_bytes,
+        include_sensitive,
+        include_binaries,
+        autocommit,
+        commit_message,
+        git_include_ignored,
+        git_init,
     )
 
 
@@ -2208,7 +3484,9 @@ def git_autocommit(commit_message: str | None, include_ignored: bool) -> None:
             sh(["git", "add", "-f", "."])
             # Also pick up currently-ignored tracked deletions/renames
             try:
-                ignored = sh(["git", "ls-files", "-i", "--exclude-standard"]).stdout.splitlines()
+                ignored = sh(
+                    ["git", "ls-files", "-i", "--exclude-standard"]
+                ).stdout.splitlines()
                 if ignored:
                     # Best-effort force add; ignore failures
                     sh(["git", "add", "-f"] + ignored, check=False)
@@ -2216,7 +3494,9 @@ def git_autocommit(commit_message: str | None, include_ignored: bool) -> None:
                 pass
 
         # Show staged summary for diagnostics
-        staged = sh(["git", "diff", "--cached", "--name-only"], check=False).stdout.strip()
+        staged = sh(
+            ["git", "diff", "--cached", "--name-only"], check=False
+        ).stdout.strip()
         if not staged:
             print("[info] nothing staged; no commit made")
             return
@@ -2226,11 +3506,19 @@ def git_autocommit(commit_message: str | None, include_ignored: bool) -> None:
             commit_message = f"auto-commit before export ({ts})"
 
         # Commit with inline identity so global config is not required
-        res = sh([
-            "git", "-c", "user.name=Repo Exporter",
-            "-c", "user.email=exporter@local",
-            "commit", "-m", commit_message
-        ], check=False)
+        res = sh(
+            [
+                "git",
+                "-c",
+                "user.name=Repo Exporter",
+                "-c",
+                "user.email=exporter@local",
+                "commit",
+                "-m",
+                commit_message,
+            ],
+            check=False,
+        )
         if res.returncode != 0:
             print(res.stdout)
             print(res.stderr, file=sys.stderr)
@@ -2288,13 +3576,22 @@ def write_binary_preview(out, path: Path):
 
 def main():
     (
-        out_path, max_bytes, include_sensitive, include_binaries,
-        autocommit, commit_message, git_include_ignored, git_init
+        out_path,
+        max_bytes,
+        include_sensitive,
+        include_binaries,
+        autocommit,
+        commit_message,
+        git_include_ignored,
+        git_init,
     ) = parse_args(sys.argv[1:])
 
     # Optionally initialize a repo
     if git_init and not ensure_git_repo(git_init=True):
-        print("[warn] could not initialize Git; continuing without autocommit", file=sys.stderr)
+        print(
+            "[warn] could not initialize Git; continuing without autocommit",
+            file=sys.stderr,
+        )
 
     # Commit first if requested
     if autocommit:
@@ -2306,7 +3603,9 @@ def main():
             rel = p.relative_to(ROOT)
         except Exception:
             rel = p
-        if should_skip(rel, include_sensitive=include_sensitive, include_binaries=include_binaries):
+        if should_skip(
+            rel, include_sensitive=include_sensitive, include_binaries=include_binaries
+        ):
             continue
         try:
             size = (ROOT / rel).stat().st_size
@@ -2433,6 +3732,11 @@ FILE: fixtures/sample_data.json
 ]
 
 ================================================================================
+FILE: guest_id.txt
+================================================================================
+fake id bytes
+
+================================================================================
 FILE: manage.py
 ================================================================================
 #!/usr/bin/env python
@@ -2471,3 +3775,355 @@ django-filter==24.3
 flake8
 drf-spectacular
 drf-spectacular-sidecar
+django-crontab==0.7.1
+
+================================================================================
+FILE: tests/test_permissions.py:
+================================================================================
+# core/tests/test_permissions.py
+from django.test import TestCase
+from django.contrib.auth import get_user_model
+from rest_framework.test import APIClient
+
+from accounts.models import UserProfile, UnitAccess
+from core.models import Condo, Unit, ParkingSpot, ShortTermBooking
+
+
+def mk_user(username, role, is_staff=False, password="pass"):
+    U = get_user_model()
+    u, created = U.objects.get_or_create(username=username, defaults={"email": f"{username}@example.com"})
+    if created:
+        u.set_password(password)
+        u.is_staff = is_staff
+        u.save()
+    prof, _ = UserProfile.objects.get_or_create(user=u)
+    prof.role = role
+    prof.save()
+    return u
+
+
+class PermissionsMatrixTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # Condo/Unit/Spot
+        cls.condo = Condo.objects.create(code="CC01", name="Cloud Condo One", city="Toronto", province="ON")
+        cls.unit101 = Unit.objects.create(condo=cls.condo, unit_number="101", owner_name="Owner A", owner_email="owna@example.com", status="active")
+        cls.unit102 = Unit.objects.create(condo=cls.condo, unit_number="102", owner_name="Owner B", owner_email="ownb@example.com", status="active")
+        cls.spotA1 = ParkingSpot.objects.create(condo=cls.condo, code="A1", level="P1", spot_type="visitor")
+
+        # Users
+        cls.pm = mk_user("pm_test", "pm", is_staff=True)
+        cls.con = mk_user("con_test", "con", is_staff=True)
+        cls.agent = mk_user("agent_test", "agent")
+        cls.owner = mk_user("owner_test", "own")
+
+        # Access: agent + owner can act on unit101 only
+        UnitAccess.objects.create(user=cls.agent, unit=cls.unit101)
+        UnitAccess.objects.create(user=cls.owner, unit=cls.unit101)
+
+    def _auth(self, user=None):
+        c = APIClient()
+        if user:
+            c.force_authenticate(user=user)
+        return c
+
+    # ---- Unauthed ----
+    def test_unauthed_cannot_list_units(self):
+        c = self._auth(None)
+        r = c.get("/api/units/")
+        self.assertEqual(r.status_code, 401)
+
+    # ---- PM ----
+    def test_pm_can_import_export_csv(self):
+        c = self._auth(self.pm)
+        # export
+        r = c.get("/api/assignments/export.csv")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("text/csv", r["Content-Type"])
+
+        # import back the same bytes
+        from io import BytesIO
+        f = BytesIO(r.content)
+        f.name = "assignments.csv"
+        r2 = c.post("/api/assignments/import.csv", {"file": f}, format="multipart")
+        self.assertEqual(r2.status_code, 200)
+
+    # ---- Concierge ----
+    def test_concierge_cannot_import_csv(self):
+        c = self._auth(self.con)
+        r = c.get("/api/assignments/export.csv")
+        self.assertEqual(r.status_code, 403)
+        # But concierge can list bookings
+        r2 = c.get("/api/bookings/")
+        # Might be 200 (no data) or 200 with seeded one in other tests
+        self.assertEqual(r2.status_code, 200)
+
+    # ---- Agent / Owner booking rules ----
+    def test_agent_can_create_booking_only_for_accessible_unit(self):
+        c = self._auth(self.agent)
+        payload_ok = {
+            "unit": self.unit101.id,
+            "guest_first_name": "A",
+            "guest_last_name": "B",
+            "id_type": "passport",
+            "id_number": "X1",
+            "id_country": "CA",
+            "vehicle_plate": "ABC123",
+            "parking_spot": self.spotA1.id,
+            "check_in": "2025-09-21",
+            "check_out": "2025-09-22",
+        }
+        r1 = c.post("/api/bookings/", payload_ok, format="json")
+        self.assertIn(r1.status_code, (201, 200))
+
+        payload_bad = dict(payload_ok, unit=self.unit102.id)
+        r2 = c.post("/api/bookings/", payload_bad, format="json")
+        self.assertEqual(r2.status_code, 403)
+
+    def test_owner_can_only_see_own_units(self):
+        c = self._auth(self.owner)
+        r = c.get("/api/units/")
+        self.assertEqual(r.status_code, 200)
+        nums = [u["unit_number"] for u in r.json()["results"]]
+        self.assertIn("101", nums)
+        self.assertNotIn("102", nums)
+
+
+class OpenAPISchemaTests(TestCase):
+    def test_schema_endpoint_ok(self):
+        c = APIClient()
+        # SpectacularAPIView is public by default; if not, auth accordingly
+        r = c.get("/api/schema/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("openapi", r.json())
+
+================================================================================
+FILE: tests/test_permissions_and_docs.py
+================================================================================
+import csv
+import io
+
+from django.contrib.auth import get_user_model
+from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
+
+from accounts.models import UnitAccess, UserProfile
+from core.models import Condo, ParkingSpot, Unit, UnitParkingAssignment
+
+
+class BaseAPITest(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        U = get_user_model()
+
+        # Users + roles
+        self.pm = U.objects.create_user(
+            username="pm", password="x", email="pm@example.com", is_staff=True
+        )
+        UserProfile.objects.create(user=self.pm, role="pm")
+
+        self.con = U.objects.create_user(
+            username="con", password="x", email="con@example.com"
+        )
+        UserProfile.objects.create(user=self.con, role="con")
+
+        self.agent = U.objects.create_user(
+            username="agent", password="x", email="agent@example.com"
+        )
+        UserProfile.objects.create(user=self.agent, role="agent")
+
+        self.owner = U.objects.create_user(
+            username="owner", password="x", email="owner@example.com"
+        )
+        UserProfile.objects.create(user=self.owner, role="own")
+
+        self.rando = U.objects.create_user(
+            username="rando", password="x", email="rando@example.com"
+        )
+        UserProfile.objects.create(user=self.rando, role=None)
+
+        # Data
+        self.condo = Condo.objects.create(
+            code="C1", name="Condo One", city="Toronto", province="ON"
+        )
+        self.unit1 = Unit.objects.create(
+            condo=self.condo,
+            unit_number="101",
+            owner_name="Alice",
+            owner_email="a@x",
+            status="active",
+        )
+        self.unit2 = Unit.objects.create(
+            condo=self.condo,
+            unit_number="102",
+            owner_name="Bob",
+            owner_email="b@x",
+            status="active",
+        )
+
+        self.spot1 = ParkingSpot.objects.create(
+            condo=self.condo, code="S1", level="L1", spot_type="standard"
+        )
+        self.spot2 = ParkingSpot.objects.create(
+            condo=self.condo, code="S2", level="L1", spot_type="standard"
+        )
+
+        # Owner + Agent only see unit1
+        UnitAccess.objects.create(user=self.owner, unit=self.unit1)
+        UnitAccess.objects.create(user=self.agent, unit=self.unit1)
+
+        UnitParkingAssignment.objects.create(
+            unit=self.unit1, parking_spot=self.spot1, is_primary=True
+        )
+        UnitParkingAssignment.objects.create(
+            unit=self.unit2, parking_spot=self.spot2, is_primary=True
+        )
+
+    # ------- Auth required on core endpoints -------
+    def test_units_requires_auth(self):
+        resp = self.client.get("/api/units/")
+        self.assertEqual(resp.status_code, 401)
+
+    # ------- PM full access; list all units -------
+    def test_pm_can_list_all_units(self):
+        self.client.force_authenticate(self.pm)
+        resp = self.client.get("/api/units/")
+        self.assertEqual(resp.status_code, 200)
+        # should see both 101 and 102
+        nums = [row["unit_number"] for row in resp.data["results"]]
+        self.assertCountEqual(nums, ["101", "102"])
+
+    # ------- Owner sees only own units (via UnitAccess) -------
+    def test_owner_sees_only_own_units(self):
+        self.client.force_authenticate(self.owner)
+        resp = self.client.get("/api/units/")
+        self.assertEqual(resp.status_code, 200)
+        nums = [row["unit_number"] for row in resp.data["results"]]
+        self.assertEqual(nums, ["101"])
+
+    # ------- Agent sees only own units (via UnitAccess) -------
+    def test_agent_sees_only_own_units(self):
+        self.client.force_authenticate(self.agent)
+        resp = self.client.get("/api/units/")
+        self.assertEqual(resp.status_code, 200)
+        nums = [row["unit_number"] for row in resp.data["results"]]
+        self.assertEqual(nums, ["101"])
+
+    # ------- Concierge read-only for most models (enforced by view perms) -------
+    def test_concierge_list_units_ok(self):
+        self.client.force_authenticate(self.con)
+        resp = self.client.get("/api/units/")
+        self.assertEqual(resp.status_code, 200)
+
+    # ------- CSV export/import: PM only -------
+    def test_csv_export_import_permissions(self):
+        # export denied for concierge
+        self.client.force_authenticate(self.con)
+        resp = self.client.get("/api/assignments/export.csv")
+        self.assertEqual(resp.status_code, 403)
+
+        # export allowed for PM
+        self.client.force_authenticate(self.pm)
+        resp = self.client.get("/api/assignments/export.csv")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp["Content-Type"])
+
+        # import denied for owner/agent/concierge
+        for user in [self.owner, self.agent, self.con]:
+            self.client.force_authenticate(user)
+            resp = self.client.post(
+                "/api/assignments/import.csv", data={}, format="multipart"
+            )
+            self.assertEqual(resp.status_code, 403)
+
+        # import allowed for PM (send a minimal valid CSV from memory)
+        self.client.force_authenticate(self.pm)
+        mem = io.StringIO()
+        w = csv.writer(mem)
+        # Header assumed by your service:
+        w.writerow(
+            [
+                "condo_code",
+                "unit_number",
+                "parking_code",
+                "status",
+                "effective_start",
+                "effective_end",
+            ]
+        )
+        w.writerow(["C1", "101", "S1", "active", "", ""])
+        mem.seek(0)
+
+        resp = self.client.post(
+            "/api/assignments/import.csv",
+            data={"file": io.BytesIO(mem.read().encode("utf-8"))},
+            format="multipart",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("created", resp.data)
+        self.assertIn("updated", resp.data)
+        self.assertIn("errors", resp.data)
+
+    # ------- Docs available anonymously (schema/docs) -------
+    def test_openapi_schema_and_docs(self):
+        resp = self.client.get("/api/schema/")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/api/docs/")
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/api/redoc/")
+        self.assertEqual(resp.status_code, 200)
+
+================================================================================
+FILE: tests/test_reports.py
+================================================================================
+# core/tests/test_reports.py
+from django.contrib.auth.models import User
+from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
+
+from core.models import Unit
+
+
+class ReportsTests(TestCase):
+    fixtures = ["sample_data.json"]
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="t", password="t")
+        self.client = APIClient()
+        # JWT not required for test; we can force authenticate
+        self.client.force_authenticate(user=self.user)
+
+    def test_unit_bookings(self):
+        unit = Unit.objects.first()
+        resp = self.client.get(f"/api/reports/unit/{unit.id}/bookings")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("results", resp.json())
+
+    def test_available_spots(self):
+        resp = self.client.get(
+            "/api/reports/available-spots", {"date": "2025-09-16", "condo_id": 1}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("results", resp.json())
+
+    def test_upcoming(self):
+        resp = self.client.get("/api/reports/upcoming-checkpoints", {"window": "7d"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("results", resp.json())
+
+================================================================================
+FILE: tests/test_smoke.py
+================================================================================
+# core/tests/test_smoke.py
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+
+class SmokeTests(TestCase):
+    def test_healthz(self):
+        c = APIClient()
+        r = c.get("/api/healthz")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"ok": True})

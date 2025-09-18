@@ -16,7 +16,7 @@ CSV_FIELDS_EXPORT = [
     "effective_end",
 ]
 
-# We’ll accept either start_date/end_date OR effective_start/effective_end on import
+# We accept either start_date/end_date OR effective_start/effective_end on import
 CSV_FIELDS_IMPORT_ALLOWED = {
     "condo_code",
     "unit_number",
@@ -31,19 +31,14 @@ CSV_FIELDS_IMPORT_ALLOWED = {
 
 
 def _parse_date(val: str):
-    """
-    Accepts: YYYY-MM-DD, empty/None. Returns date or None.
-    """
     if not val:
         return None
     val = str(val).strip()
     if not val:
         return None
-    # try ISO format first
     try:
         return datetime.strptime(val, "%Y-%m-%d").date()
     except Exception:
-        # last resort: let fromisoformat try (can raise)
         return date.fromisoformat(val)
 
 
@@ -58,25 +53,20 @@ def export_assignments_to_csv() -> Tuple[str, bytes]:
     rows: List[List[str]] = []
     today = date.today()
 
-    # Select related for speed
     qs = UnitParkingAssignment.objects.select_related(
         "unit__condo", "parking_spot__condo"
     ).order_by(
-        "unit__condo__code",
-        "unit__unit_number",
-        "parking_spot__code",
-        "start_date",
+        "unit__condo__code", "unit__unit_number", "parking_spot__code", "start_date"
     )
 
     for a in qs:
-        condo_code = a.unit.condo.code  # unit & spot share condo by validation
+        condo_code = a.unit.condo.code
         unit_number = a.unit.unit_number
         parking_code = a.parking_spot.code
         eff_start = a.start_date.isoformat() if a.start_date else ""
         eff_end = a.end_date.isoformat() if a.end_date else ""
         is_active = (a.end_date is None) or (a.end_date >= today)
         status = "active" if is_active else "inactive"
-
         rows.append([condo_code, unit_number, parking_code, status, eff_start, eff_end])
 
     buffer = io.StringIO(newline="")
@@ -89,40 +79,46 @@ def export_assignments_to_csv() -> Tuple[str, bytes]:
     return filename, content_bytes
 
 
+def _errors_to_csv(error_rows: List[Dict[str, Any]]) -> str:
+    sio = io.StringIO(newline="")
+    fieldnames = ["row_number", "error", "condo_code", "unit_number", "parking_code"]
+    writer = csv.DictWriter(sio, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in error_rows:
+        row = r.get("row", {}) or {}
+        writer.writerow(
+            {
+                "row_number": r.get("row_number"),
+                "error": r.get("error"),
+                "condo_code": (row.get("condo_code") or "").strip(),
+                "unit_number": (row.get("unit_number") or "").strip(),
+                "parking_code": (row.get("parking_code") or "").strip(),
+            }
+        )
+    return sio.getvalue()
+
+
 @transaction.atomic
-def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
+def import_assignments_from_csv(uploaded_file, dry_run: bool = False) -> Dict[str, Any]:
     """
     Upsert assignments from a CSV file.
 
     Accepted headers (case-sensitive):
       required: condo_code, unit_number, parking_code
       optional: is_primary, start_date, end_date OR effective_start, effective_end
-      optional: status (ignored; we compute status from dates)
+      optional: status (ignored; computed)
 
-    Behavior:
-      - For (condo_code, unit_number, parking_code) find related models.
-      - If a UnitParkingAssignment with that (unit, parking_spot) exists, update fields.
-      - Else create a new assignment.
-      - We do NOT delete/archive missing rows in this basic import (keeps it safe).
-
-    Returns:
-      {
-        "created": int,
-        "updated": int,
-        "errors": int,
-        "error_rows": [ {"row_number": n, "error": "...", "row": {...}}, ... ],
-        "total_rows": int
-      }
+    When dry_run=True:
+      - perform full validation
+      - return the same structure but do NOT write any DB changes
     """
-    # Handle InMemoryUploadedFile / TemporaryUploadedFile and plain file-like objects
+    # read file payload
     if hasattr(uploaded_file, "read"):
         raw = uploaded_file.read()
-        if isinstance(raw, bytes):
-            text = raw.decode("utf-8-sig")
-        else:
-            text = raw
+        text = (
+            raw.decode("utf-8-sig") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        )
     else:
-        # If someone passed us path or bytes
         text = (
             uploaded_file.decode("utf-8-sig")
             if isinstance(uploaded_file, (bytes, bytearray))
@@ -132,33 +128,34 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
     f = io.StringIO(text)
     reader = csv.DictReader(f)
 
-    # Validate headers
     field_set = set(reader.fieldnames or [])
     missing = {"condo_code", "unit_number", "parking_code"} - field_set
     if missing:
+        errors = [
+            {
+                "row_number": 0,
+                "error": f"Missing required columns: {', '.join(sorted(missing))}",
+                "row": {},
+            }
+        ]
         return {
             "created": 0,
             "updated": 0,
-            "errors": 1,
-            "error_rows": [
-                {
-                    "row_number": 0,
-                    "error": f"Missing required columns: {', '.join(sorted(missing))}",
-                    "row": {},
-                }
-            ],
+            "errors": len(errors),
+            "error_rows": errors,
             "total_rows": 0,
+            "errors_csv": _errors_to_csv(errors),
         }
-
-    # Extra unknown fields? Not fatal; we simply ignore them.
-    # (No temp variables here to satisfy flake8 F841.)
-    # unknown = field_set - CSV_FIELDS_IMPORT_ALLOWED  # ignored
 
     created = 0
     updated = 0
     errors = 0
     error_rows: List[Dict[str, Any]] = []
     total = 0
+
+    # Keep a list of objects to write only if not dry_run
+    pending_updates: List[UnitParkingAssignment] = []
+    pending_creates: List[UnitParkingAssignment] = []
 
     for idx, row in enumerate(reader, start=2):  # header is line 1
         total += 1
@@ -168,7 +165,6 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
             parking_code = (row.get("parking_code") or "").strip()
             is_primary_raw = (row.get("is_primary") or "").strip()
 
-            # pick date fields from either {start_date,end_date} or {effective_start,effective_end}
             start_raw = (
                 row.get("start_date") or row.get("effective_start") or ""
             ).strip()
@@ -196,7 +192,6 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
                     f"Parking spot not found: condo={condo_code} code={parking_code}"
                 )
 
-            # parse flags/dates
             is_primary = None
             if is_primary_raw != "":
                 is_primary = str(is_primary_raw).lower() in {
@@ -210,7 +205,6 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
             start_date = _parse_date(start_raw) if start_raw else None
             end_date = _parse_date(end_raw) if end_raw else None
 
-            # upsert by (unit, parking_spot)
             obj, existed = UnitParkingAssignment.objects.get_or_create(
                 unit=unit,
                 parking_spot=spot,
@@ -221,10 +215,12 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
                 },
             )
             if existed:
-                created += 1
+                if dry_run:
+                    created += 1  # would be created
+                else:
+                    created += 1
             else:
                 changed = False
-                # Only update fields that were provided (leave others intact)
                 if start_date is not None and obj.start_date != start_date:
                     obj.start_date = start_date
                     changed = True
@@ -235,18 +231,23 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
                     obj.is_primary = bool(is_primary)
                     changed = True
                 if changed:
-                    obj.save(update_fields=["start_date", "end_date", "is_primary"])
-                    updated += 1
+                    if dry_run:
+                        updated += 1  # would be updated
+                    else:
+                        pending_updates.append(obj)
 
         except Exception as e:
             errors += 1
-            error_rows.append(
-                {
-                    "row_number": idx,
-                    "error": str(e),
-                    "row": row,
-                }
+            error_rows.append({"row_number": idx, "error": str(e), "row": row})
+
+    # Apply writes if not dry_run
+    if not dry_run:
+        if pending_creates:
+            UnitParkingAssignment.objects.bulk_create(
+                pending_creates, ignore_conflicts=True
             )
+        for obj in pending_updates:
+            obj.save(update_fields=["start_date", "end_date", "is_primary"])
 
     return {
         "created": created,
@@ -254,4 +255,5 @@ def import_assignments_from_csv(uploaded_file) -> Dict[str, Any]:
         "errors": errors,
         "error_rows": error_rows,
         "total_rows": total,
+        "errors_csv": _errors_to_csv(error_rows) if errors else "",
     }
