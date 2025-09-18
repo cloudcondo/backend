@@ -2,11 +2,13 @@ from datetime import datetime
 from pathlib import Path
 
 from django.conf import settings
-from django.http import FileResponse, HttpResponse
+from django.http import HttpResponse
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from accounts.permissions import IsAuthenticatedJWT, IsPropertyManager
 
 from .services.csv_assignments import (
     export_assignments_to_csv,
@@ -14,8 +16,10 @@ from .services.csv_assignments import (
 )
 
 
+@extend_schema(tags=["Assignments"])
 class AssignmentsCSVExportView(APIView):
-    permission_classes = [IsAuthenticated]
+    # PM only
+    permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
 
     def get(self, request):
         filename, content = export_assignments_to_csv()
@@ -24,6 +28,7 @@ class AssignmentsCSVExportView(APIView):
         return response
 
 
+@extend_schema(tags=["Assignments"])
 class AssignmentsCSVImportView(APIView):
     """
     POST multipart/form-data with 'file'.
@@ -31,7 +36,8 @@ class AssignmentsCSVImportView(APIView):
     Returns JSON summary and, if errors, a link to an error CSV file when not dry_run.
     """
 
-    permission_classes = [IsAuthenticated]
+    # PM only
+    permission_classes = [IsAuthenticatedJWT & IsPropertyManager]
 
     def post(self, request):
         file = request.FILES.get("file")
@@ -50,7 +56,6 @@ class AssignmentsCSVImportView(APIView):
 
         errors_path = ""
         if result.get("errors") and not dry_run:
-            # write error csv to MEDIA_ROOT/import_errors
             media_root = Path(getattr(settings, "MEDIA_ROOT", "media"))
             out_dir = media_root / "import_errors"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +73,6 @@ class AssignmentsCSVImportView(APIView):
             "total_rows": result.get("total_rows"),
             "dry_run": dry_run,
             "errors_csv_url": errors_path,
-            "error_rows": result.get("error_rows", []),  # keep details for UI too
+            "error_rows": result.get("error_rows", []),
         }
         return Response(payload, status=status.HTTP_200_OK)

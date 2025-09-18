@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.12", "3.13" ]  # keep 3.12; add 3.13 to match local
+        python-version: [ "3.12", "3.13" ]
     steps:
       - uses: actions/checkout@v4
 
@@ -33,15 +33,12 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-${{ matrix.python-version }}-
 
-      - name: Install system packages (none required)
-        run: sudo apt-get update
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-            - name: Django checks, migrate, seed, test
+      - name: Django checks, migrate, seed, schema
         env:
           DJANGO_SETTINGS_MODULE: condo_backend.settings
           SECRET_KEY: ci-only-secret-key-change-me
@@ -53,13 +50,24 @@ jobs:
           python manage.py migrate --noinput
           python manage.py load_sample_data || true
           python manage.py spectacular --file schema.yaml
+
+      - name: CI dry-run CSV import (smoke)
+        env:
+          DJANGO_SETTINGS_MODULE: condo_backend.settings
+        run: |
+          python manage.py ci_dry_run_import_check
+
+      - name: Run test suite
+        env:
+          DJANGO_SETTINGS_MODULE: condo_backend.settings
+        run: |
           python manage.py test --verbosity 2
+
       - name: Upload schema artifact
         uses: actions/upload-artifact@v4
         with:
           name: openapi-schema
           path: schema.yaml
-
 
   build-and-push:
     name: Build and push Docker image to GHCR

@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 from django.db.models import Q
 from django.utils.dateparse import parse_date
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -13,7 +14,6 @@ from .models import ParkingSpot, ShortTermBooking, Unit, UnitParkingAssignment
 
 
 def _parse_window(window_param: str) -> timedelta:
-    # e.g., "7d" -> 7 days
     if not window_param:
         return timedelta(days=7)
     try:
@@ -24,6 +24,7 @@ def _parse_window(window_param: str) -> timedelta:
         return timedelta(days=7)
 
 
+@extend_schema(tags=["Reports"])
 class UnitBookingsReportView(APIView):
     """
     GET /reports/unit/{id}/bookings
@@ -69,6 +70,7 @@ class UnitBookingsReportView(APIView):
         return Response({"unit": str(unit), "count": len(data), "results": data})
 
 
+@extend_schema(tags=["Reports"])
 class AvailableSpotsReportView(APIView):
     """
     GET /reports/available-spots?date=YYYY-MM-DD&condo_id=<id>
@@ -90,10 +92,8 @@ class AvailableSpotsReportView(APIView):
                 {"detail": "Missing condo_id."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Spots in the condo
         spots = ParkingSpot.objects.filter(condo_id=condo_id)
 
-        # Spots assigned on the date (active assignment range includes d)
         active_assignments = UnitParkingAssignment.objects.filter(
             parking_spot__in=spots,
             start_date__lte=d,
@@ -102,7 +102,6 @@ class AvailableSpotsReportView(APIView):
             active_assignments.values_list("parking_spot_id", flat=True)
         )
 
-        # Spots booked for the date (inclusive overlap)
         day_q = Q(check_in__lte=d, check_out__gte=d)
         day_booked_spot_ids = set(
             ShortTermBooking.objects.filter(parking_spot__in=spots)
@@ -127,6 +126,7 @@ class AvailableSpotsReportView(APIView):
         )
 
 
+@extend_schema(tags=["Reports"])
 class UpcomingCheckpointsReportView(APIView):
     """
     GET /reports/upcoming-checkpoints?window=7d

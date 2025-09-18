@@ -1,3 +1,4 @@
+from drf_spectacular.utils import extend_schema
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -6,6 +7,7 @@ from rest_framework.views import APIView
 from .models import ParkingSpot, Unit, UnitParkingAssignment
 
 
+@extend_schema(tags=["Lookups"])
 class UnitParkingLookupView(APIView):
     """
     GET /api/units/<unit_id>/parking
@@ -45,6 +47,7 @@ class UnitParkingLookupView(APIView):
         return Response({"unit": str(unit), "count": len(results), "results": results})
 
 
+@extend_schema(tags=["Lookups"])
 class SpotUnitLookupView(APIView):
     """
     GET /api/spots/<spot_id>/unit
